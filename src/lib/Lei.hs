@@ -11,6 +11,7 @@ module Lei
   -- * Model
   , Model
   , mkModel
+  , runModel
 
   -- * Controller
   , Controller
@@ -183,13 +184,7 @@ nestController0 s r cer = C $ \r2r0 o2o0 -> Pipes.hoist
 --------------------------------------------------------------------------------
 
 newtype ViewRender v r s x = ViewRender
-  { runViewRender :: IO () -> (r -> IO ()) -> s -> v -> (x, v) }
-
-mkViewRender
-  :: (IO () -> (r -> IO ()) -> s -> State.State v x)
-  -> ViewRender v r s x
-mkViewRender k = ViewRender $ \stopIO reqIO s v ->
-                    State.runState (k stopIO reqIO s) v
+  { runViewRender :: IO () -> (r -> IO ()) -> s -> State.State v x }
 
 --------------------------------------------------------------------------------
 
@@ -208,7 +203,7 @@ mkView
   -> View v r s m x -- ^
 mkView vi = View $ do
   (v, iovs, k) <- vi
-  return (v, mkViewStop iovs, mkViewRender k)
+  return (v, mkViewStop iovs, ViewRender k)
 
 -- Like 'mkView', except for when there is no view state, initialization nor
 -- finalization to worry about.
@@ -232,14 +227,14 @@ runViewInit (ViewInit s) = State.runStateT s mempty
 nestView
  :: Monad m
  => Lens' v' v
+ -> (r -> r')
  -> View v r s m x
- -> ViewInit v' m (v, ViewRender v' r s x)
-nestView l avw = ViewInit $ do
+ -> ViewInit v' m (v, ViewRender v' r' s x)
+nestView l r2r' avw = ViewInit $ do
    (av, avs, avr) <- lift $ runView avw
    State.modify $ mappend (contramapViewStop (lensView l) avs)
-   let vr = ViewRender $ \vs' reqIO s v' ->
-         let (x, v) = runViewRender avr vs' reqIO s (lensView l v')
-         in (x, lensSet l v v')
+   let vr = ViewRender $ \vs' reqIO s ->
+               lensZoom l $ runViewRender avr vs' (reqIO . r2r') s
    return (av, vr)
 
 --------------------------------------------------------------------------------
@@ -305,7 +300,8 @@ run bracket s0 m cer vw = do
                        (\s -> STM.atomically $ do
                            void $ STM.tryPutTMVar tmvSLast $ Right s)
                        (\s -> do
-                           let (io, v') = runViewRender vr stopIO reqIO s v
+                           let st = runViewRender vr stopIO reqIO s
+                               (io, v') = State.runState st v
                            io >> loop v')
     bracket
        (do (v, vs, vr) <- runView vw
@@ -352,3 +348,8 @@ lensSet l b = runIdentity . l (\_ -> Identity b)
 
 lensView :: Lens' s a -> s -> a
 lensView l = getConst . l Const
+
+lensZoom :: Lens' a b -> State.State b x -> State.State a x
+lensZoom l sb = State.state $ \a ->
+    let (x, b) = State.runState sb (lensView l a)
+    in (x, lensSet l b a)
