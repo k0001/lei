@@ -37,6 +37,8 @@ module Lei
   , ViewRender
   , runViewRender
 
+  -- * Debug
+  , Debug(..)
   ) where
 
 import           Control.Applicative
@@ -242,11 +244,13 @@ nestView l r2r' avw = ViewInit $ do
 -- | Run a Lei application.
 --
 run
-  :: forall r o v s m
+  :: forall r o v s m a
    . (MonadIO m, Eq s)
   => (forall x y z . m x -> (x -> m y) -> (x -> m z) -> m z)
   -- ^ 'Control.Exception.bracket'-like function.
   --    Hint: use 'Control.Monad.Catch.bracket' from "Control.Monad.Catch".
+  -> (IO (Debug v r o s) -> IO a)
+  -- ^ Loop monitoring events.
   -> s
   -- ^ Initial model state.
   -> Model o s
@@ -257,7 +261,10 @@ run
   -> View v r s m (IO ())
      -- ^ /View/ issuing controller requests and rendering the model.
   -> m ()
-run bracket s0 m cer vw = do
+run bracket dbg0 s0 m cer vw = do
+    -- Debug broadcast channel
+    tcbDebug <- liftIO $ STM.newBroadcastTChanIO
+    let dbgIO = STM.atomically . STM.writeTChan tcbDebug
     -- Channel through which requests are sent
     tqR <- liftIO $ STM.newTQueueIO
     let reqIO = STM.atomically . STM.writeTQueue tqR
@@ -266,13 +273,17 @@ run bracket s0 m cer vw = do
     tmvSLast <- liftIO $ STM.newTMVarIO (Right s0)
     -- TVar indicating whether to stop execution
     tvStop <- liftIO $ STM.newTVarIO False -- TODO: a `MVar ()` should do
-    let stopIO = STM.atomically $ STM.writeTVar tvStop True
+    let stopIO = STM.atomically $ do
+          STM.writeTVar tvStop True
+          STM.writeTChan tcbDebug DebugStopRequested
     -- Handle an incomming requests
     let handlerLoop :: m ()
         handlerLoop = ($ s0) $ fix $ \loop s -> do
            stopped <- liftIO $ STM.atomically $ STM.readTVar tvStop
            unless stopped $ do
-              r <- liftIO $ STM.atomically $ STM.readTQueue tqR
+              r <- liftIO $ STM.atomically $ do
+                 r <- STM.readTQueue tqR
+                 r <$ STM.writeTChan tcbDebug (DebugReqStart r s)
               os <- Pipes.runEffect $ do
                  Pipes.for (runController cer id id s r) $ \mr' -> do
                     case mr' of
@@ -281,7 +292,11 @@ run bracket s0 m cer vw = do
               let !s' = foldl' (flip (runModel m)) s os
               liftIO $ STM.atomically $ do
                  void $ STM.tryTakeTMVar tmvSLast
-                 STM.putTMVar tmvSLast $! (if s == s' then Left else Right) s'
+                 if s == s'
+                    then do STM.putTMVar tmvSLast (Left s')
+                            STM.writeTChan tcbDebug $ DebugStateSame os s'
+                    else do STM.putTMVar tmvSLast (Right s')
+                            STM.writeTChan tcbDebug $ DebugStateNew os s'
               loop s'
     -- Render the model
     let renderLoop :: v -> ViewStop v -> ViewRender v r s (IO ()) -> IO ()
@@ -296,21 +311,41 @@ run bracket s0 m cer vw = do
                            es <- STM.takeTMVar tmvSLast
                            case es of
                               Left _ -> STM.retry
-                              Right s -> return s)
+                              Right s -> do
+                                STM.writeTChan tcbDebug (DebugRenderStart v s)
+                                return s)
                        (\s -> STM.atomically $ do
                            void $ STM.tryPutTMVar tmvSLast $ Right s)
                        (\s -> do
                            let st = runViewRender vr stopIO reqIO s
                                (io, v') = State.runState st v
                            io >> loop v')
-    bracket
+        debugging :: forall x. m x -> m x
+        debugging k = bracket
+           (liftIO $ do
+              tcbDebug' <- STM.atomically $ STM.dupTChan tcbDebug
+              Async.async $ dbg0 $ STM.atomically $ STM.readTChan tcbDebug')
+           (liftIO . Async.cancel)
+           (\_ -> k)
+
+    debugging $ bracket
        (do (v, vs, vr) <- runView vw
+           liftIO $ dbgIO $ DebugViewInitialized v
            liftIO $ flip Ex.onException (runViewStop vs v) $ do
               a1 <- Async.async $ renderLoop v vs vr
               a1 <$ Async.link a1)
        (liftIO . Async.cancel)
        (\a1 -> handlerLoop >> liftIO (Async.wait a1))
 
+
+data Debug v r o s
+  = DebugStopRequested
+  | DebugViewInitialized v
+  | DebugRenderStart v s
+  | DebugReqStart r s
+  | DebugStateNew (Seq o) s
+  | DebugStateSame (Seq o) s
+  deriving (Show)
 
 --------------------------------------------------------------------------------
 -- Internal tools

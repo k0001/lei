@@ -146,7 +146,7 @@ main :: IO ()
 main = do
     Just s0 <- return $ def 5
     venv <- newEnv
-    Lei.run Ex.bracket s0 model controller (view venv)
+    Lei.run Ex.bracket (\_ -> return ()) s0 model controller (view venv)
 
 --------------------------------------------------------------------------------
 -- Internal tools
