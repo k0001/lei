@@ -22,6 +22,7 @@ module Lei
   , op
   , stop
   , bury
+  , bury2
   , nestController
   , nestController0
 
@@ -156,6 +157,14 @@ bury
   => C r0 o0 r o m a
   -> C r0 o0 r o m (C r0 o0 r' o' m a)
 bury c = C $ \r2r0 o2o0 -> return (C $ \_ _ -> runC c r2r0 o2o0)
+
+-- | Like 'bury' but for a function taking 2 arguments. Note that offering this
+-- is insane and we should provide just a single 'bury' combinator.
+bury2
+  :: Monad m
+  => (y -> z -> C r0 o0 r o m a)
+  -> C r0 o0 r o m (y -> z -> C r0 o0 r' o' m a)
+bury2 c = C $ \r2r0 o2o0 -> return (\y z -> C $ \_ _ -> runC (c y z) r2r0 o2o0)
 
 -- | Nest a 'Controller' compatible with the same top-level request
 -- and operation types.
