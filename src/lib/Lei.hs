@@ -54,6 +54,7 @@ import qualified Control.Monad.Trans.State as State
 import           Data.Foldable (foldl', traverse_)
 import           Data.Function (fix)
 import           Data.Functor.Identity (Identity(..))
+import qualified Data.IORef as IORef
 import           Data.Monoid (Monoid(..))
 import           Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
@@ -195,7 +196,24 @@ nestController0 s r cer = C $ \r2r0 o2o0 -> Pipes.hoist
 --------------------------------------------------------------------------------
 
 newtype ViewRender v r s x = ViewRender
-  { runViewRender :: IO () -> (r -> IO ()) -> s -> State.State v x }
+  { runViewRender :: IO () -> (r -> IO ()) -> s -> State.StateT v IO x }
+
+mkViewRenderCacheLast
+  :: forall v r s x
+   . (Eq v, Eq s)
+  => (IO () -> (r -> IO ()) -> s -> State.StateT v IO x)
+  -> IO (ViewRender v r s x)
+mkViewRenderCacheLast k = do
+  iorCache <- IORef.newIORef ((\_ _ -> Nothing) :: s -> v -> Maybe (x, v))
+  return $ ViewRender $ \stopIO reqIO s0 -> State.StateT $ \v0 -> do
+     cacheLookup <- IORef.readIORef iorCache
+     case cacheLookup s0 v0 of
+        Just xv -> return xv
+        Nothing -> do
+           !xv@(!_,!_) <- State.runStateT (k stopIO reqIO s0) v0
+           IORef.atomicWriteIORef iorCache $ \s v ->
+              if s == s0 && v == v0 then Just xv else Nothing
+           return xv
 
 --------------------------------------------------------------------------------
 
@@ -207,19 +225,20 @@ runView (View vi0) = do
    return (v0, mappend vs vs0, vr0)
 
 mkView
-  :: Monad m
+  :: (MonadIO m, Eq v, Eq s)
   => ViewInit v m (v,
                    v -> IO (),
-                   IO () -> (r -> IO ()) -> s -> State.State v x)
+                   IO () -> (r -> IO ()) -> s -> State.StateT v IO x)
   -> View v r s m x -- ^
 mkView vi = View $ do
   (v, iovs, k) <- vi
-  return (v, mkViewStop iovs, ViewRender k)
+  vr <- liftIO $ mkViewRenderCacheLast k
+  return (v, mkViewStop iovs, vr)
 
 -- Like 'mkView', except for when there is no view state, initialization nor
 -- finalization to worry about.
 mkView_
- :: Monad m
+ :: (Eq s, MonadIO m)
  => (IO () -> (r -> IO ()) -> s -> x)
  -> View () r s m x -- ^
 mkView_ k =
@@ -327,7 +346,7 @@ run bracket dbg0 s0 m cer vw = do
                            void $ STM.tryPutTMVar tmvSLast $ Right s)
                        (\s -> do
                            let st = runViewRender vr stopIO reqIO s
-                               (io, v') = State.runState st v
+                           (io, v') <- State.runStateT st v
                            io >> loop v')
         debugging :: forall x. m x -> m x
         debugging k = bracket
@@ -354,7 +373,7 @@ data Debug v r o s
   | DebugReqStart r s
   | DebugStateNew (Seq o) s
   | DebugStateSame (Seq o) s
-  deriving (Show)
+  deriving (Eq, Ord, Show)
 
 --------------------------------------------------------------------------------
 -- Internal tools
@@ -393,7 +412,7 @@ lensSet l b = runIdentity . l (\_ -> Identity b)
 lensView :: Lens' s a -> s -> a
 lensView l = getConst . l Const
 
-lensZoom :: Lens' a b -> State.State b x -> State.State a x
-lensZoom l sb = State.state $ \a ->
-    let (x, b) = State.runState sb (lensView l a)
-    in (x, lensSet l b a)
+lensZoom :: Monad m => Lens' a b -> State.StateT b m x -> State.StateT a m x
+lensZoom l sb = State.StateT $ \a -> do
+    (x, b) <- State.runStateT sb (lensView l a)
+    return (x, lensSet l b a)

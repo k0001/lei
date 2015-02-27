@@ -7,7 +7,7 @@ import qualified Control.Concurrent.Async as Async
 import qualified Control.Concurrent.MVar as MVar
 import qualified Control.Exception as Ex
 import           Control.Monad (forever, forM_, guard, void)
-import           Control.Monad.IO.Class (liftIO)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Foldable (traverse_)
 import qualified Lei
 import           Prelude
@@ -66,7 +66,7 @@ model = Lei.mkModel $ \o s -> case o of
 --------------------------------------------------------------------------------
 -- THE VIEW
 
-view :: Monad m => Env -> Lei.View () Req PingPongState m (IO ())
+view :: MonadIO m => Env -> Lei.View () Req PingPongState m (IO ())
 view e = Lei.mkView_ $ \stopIO reqIO s -> do
     printReport s
     envPrompter e $ do a <- readPingPong
