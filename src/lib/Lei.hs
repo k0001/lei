@@ -1,6 +1,8 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -33,10 +35,13 @@ module Lei
   , nestView
 
   , ViewStop
-  , mkViewStop
 
   , ViewRender
-  , runViewRender
+
+  , VR
+  , vrStop
+  , vrReq
+  , vrRender
 
   -- * Debug
   , Debug(..)
@@ -47,10 +52,10 @@ import qualified Control.Exception as Ex
 import           Control.Concurrent.MVar as MVar
 import           Control.Concurrent.Async as Async
 import qualified Control.Concurrent.STM as STM
-import           Control.Monad (void, unless)
+import           Control.Monad (void, unless, ap)
 import           Control.Monad.IO.Class (MonadIO(liftIO))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
-import qualified Control.Monad.Trans.State as State
+import qualified Control.Monad.State as State
 import           Data.Foldable (foldl', traverse_)
 import           Data.Function (fix)
 import           Data.Functor.Identity (Identity(..))
@@ -195,22 +200,51 @@ nestController0 s r cer = C $ \r2r0 o2o0 -> Pipes.hoist
 
 --------------------------------------------------------------------------------
 
-newtype ViewRender v r s x = ViewRender
-  { runViewRender :: IO () -> (r -> IO ()) -> s -> State.StateT v IO x }
+newtype VR v r x = VR { unVR :: IO () -> (r -> IO ()) -> v -> IO (x, v) }
+  deriving (Functor)
+
+instance Monad (VR v r) where
+  return a = VR $ \_ _ v -> return (a, v)
+  ma >>= kmb = VR $ \stopIO reqIO v -> do
+    (a, v') <- unVR ma stopIO reqIO v
+    unVR (kmb a) stopIO reqIO v'
+
+instance Applicative (VR v r) where
+  pure = return
+  (<*>) = ap
+
+instance MonadIO (VR v r) where
+  liftIO m = VR $ \_ _ v -> fmap (flip (,) v) m
+
+instance State.MonadState v (VR v r) where
+  state k = VR $ \_ _ v -> return (k v)
+
+vrStop :: VR v r (IO ())
+vrStop = VR $ \a _ v -> return (a, v)
+
+vrReq :: VR v r (r -> IO ())
+vrReq = VR $ \_ a v -> return (a, v)
+
+vrRender :: ViewRender v r s x -> s -> VR v r x
+vrRender vr s = VR $ \stopIO reqIO v -> unVR (unViewRender vr s) stopIO reqIO v
+
+--------------------------------------------------------------------------------
+
+newtype ViewRender v r s x = ViewRender { unViewRender :: s -> VR v r x }
 
 mkViewRenderCacheLast
   :: forall v r s x
    . (Eq v, Eq s)
-  => (IO () -> (r -> IO ()) -> s -> State.StateT v IO x)
+  => (s -> VR v r x)
   -> IO (ViewRender v r s x)
-mkViewRenderCacheLast k = do
+mkViewRenderCacheLast kvr = do
   iorCache <- IORef.newIORef ((\_ _ -> Nothing) :: s -> v -> Maybe (x, v))
-  return $ ViewRender $ \stopIO reqIO s0 -> State.StateT $ \v0 -> do
+  return $ ViewRender $ \s0 -> VR $ \stopIO reqIO v0 -> do
      cacheLookup <- IORef.readIORef iorCache
      case cacheLookup s0 v0 of
         Just xv -> return xv
         Nothing -> do
-           !xv@(!_,!_) <- State.runStateT (k stopIO reqIO s0) v0
+           !xv@(!_,!_) <- unVR (kvr s0) stopIO reqIO v0
            IORef.atomicWriteIORef iorCache $ \s v ->
               if s == s0 && v == v0 then Just xv else Nothing
            return xv
@@ -221,30 +255,22 @@ data View v r s m x = View !(ViewInit v m (v, ViewStop v, ViewRender v r s x))
 
 runView :: Monad m => View v r s m x -> m (v, ViewStop v, ViewRender v r s x)
 runView (View vi0) = do
-   ((v0, vs0, vr0), vs) <- runViewInit vi0
-   return (v0, mappend vs vs0, vr0)
+   ((v0, vs0, vrr0), vs) <- runViewInit vi0
+   return (v0, mappend vs vs0, vrr0)
 
 mkView
   :: (MonadIO m, Eq v, Eq s)
-  => ViewInit v m (v,
-                   v -> IO (),
-                   IO () -> (r -> IO ()) -> s -> State.StateT v IO x)
+  => ViewInit v m (v, v -> IO (), s -> VR v r x)
   -> View v r s m x -- ^
 mkView vi = View $ do
-  (v, iovs, k) <- vi
-  vr <- liftIO $ mkViewRenderCacheLast k
+  (v, iovs, kvr) <- vi
+  vr <- liftIO $ mkViewRenderCacheLast kvr
   return (v, mkViewStop iovs, vr)
 
 -- Like 'mkView', except for when there is no view state, initialization nor
 -- finalization to worry about.
-mkView_
- :: (Eq s, MonadIO m)
- => (IO () -> (r -> IO ()) -> s -> x)
- -> View () r s m x -- ^
-mkView_ k =
-    let vs = \() -> return ()
-        vr = \stopIO reqIO s -> return $! k stopIO reqIO s
-    in mkView $ return ((), vs, vr)
+mkView_ :: (Eq s, MonadIO m) => (s -> VR () r x) -> View () r s m x -- ^
+mkView_ kvr = mkView $ return ((), return, kvr)
 
 --------------------------------------------------------------------------------
 
@@ -261,11 +287,13 @@ nestView
  -> View v r s m x
  -> ViewInit v' m (v, ViewRender v' r' s x)
 nestView l r2r' avw = ViewInit $ do
-   (av, avs, avr) <- lift $ runView avw
+   (av, avs, avrr) <- lift $ runView avw
    State.modify $ mappend (contramapViewStop (lensView l) avs)
-   let vr = ViewRender $ \vs' reqIO s ->
-               lensZoom l $ runViewRender avr vs' (reqIO . r2r') s
-   return (av, vr)
+   let vrr = ViewRender $ \s0 -> VR $ \stopIO reqIO v' -> do
+               let v1 = lensView l v'
+               (x, v2) <- unVR (unViewRender avrr s0) stopIO (reqIO . r2r') v1
+               return (x, lensSet l v2 v')
+   return (av, vrr)
 
 --------------------------------------------------------------------------------
 
@@ -328,7 +356,7 @@ run bracket dbg0 s0 m cer vw = do
               loop s'
     -- Render the model
     let renderLoop :: v -> ViewStop v -> ViewRender v r s (IO ()) -> IO ()
-        renderLoop v0 vs vr = ($ v0) $ fix $ \loop v -> do
+        renderLoop v0 vs vrr = ($ v0) $ fix $ \loop v -> do
            flip Ex.onException (runViewStop vs v) $ do
               stopped <- STM.atomically $ STM.readTVar tvStop
               if stopped
@@ -345,8 +373,7 @@ run bracket dbg0 s0 m cer vw = do
                        (\s -> STM.atomically $ do
                            void $ STM.tryPutTMVar tmvSLast $ Right s)
                        (\s -> do
-                           let st = runViewRender vr stopIO reqIO s
-                           (io, v') <- State.runStateT st v
+                           (io, v') <- unVR (unViewRender vrr s) stopIO reqIO v
                            io >> loop v')
         debugging :: forall x. m x -> m x
         debugging k = bracket
@@ -357,10 +384,10 @@ run bracket dbg0 s0 m cer vw = do
            (\_ -> k)
 
     debugging $ bracket
-       (do (v, vs, vr) <- runView vw
+       (do (v, vs, vrr) <- runView vw
            liftIO $ dbgIO $ DebugViewInitialized v
            liftIO $ flip Ex.onException (runViewStop vs v) $ do
-              a1 <- Async.async $ renderLoop v vs vr
+              a1 <- Async.async $ renderLoop v vs vrr
               a1 <$ Async.link a1)
        (liftIO . Async.cancel)
        (\a1 -> handlerLoop >> liftIO (Async.wait a1))
@@ -411,8 +438,3 @@ lensSet l b = runIdentity . l (\_ -> Identity b)
 
 lensView :: Lens' s a -> s -> a
 lensView l = getConst . l Const
-
-lensZoom :: Monad m => Lens' a b -> State.StateT b m x -> State.StateT a m x
-lensZoom l sb = State.StateT $ \a -> do
-    (x, b) <- State.runStateT sb (lensView l a)
-    return (x, lensSet l b a)
