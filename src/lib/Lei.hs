@@ -40,8 +40,8 @@ module Lei
 
   , VR
   , vrStop
-  , vrReq
   , vrRender
+  , vrState
 
   -- * Debug
   , Debug(..)
@@ -219,11 +219,11 @@ instance MonadIO (VR v r) where
 instance State.MonadState v (VR v r) where
   state k = VR $ \_ _ v -> return (k v)
 
+vrState :: VR v r v
+vrState = State.get
+
 vrStop :: VR v r (IO ())
 vrStop = VR $ \a _ v -> return (a, v)
-
-vrReq :: VR v r (r -> IO ())
-vrReq = VR $ \_ a v -> return (a, v)
 
 vrRender :: ViewRender v r s x -> s -> VR v r x
 vrRender vr s = VR $ \stopIO reqIO v -> unVR (unViewRender vr s) stopIO reqIO v
@@ -235,7 +235,7 @@ newtype ViewRender v r s x = ViewRender { unViewRender :: s -> VR v r x }
 mkViewRenderCacheLast
   :: forall v r s x
    . (Eq v, Eq s)
-  => (s -> VR v r x)
+  => (s -> (r -> IO ()) -> VR v r x)
   -> IO (ViewRender v r s x)
 mkViewRenderCacheLast kvr = do
   iorCache <- IORef.newIORef ((\_ _ -> Nothing) :: s -> v -> Maybe (x, v))
@@ -244,7 +244,7 @@ mkViewRenderCacheLast kvr = do
      case cacheLookup s0 v0 of
         Just xv -> return xv
         Nothing -> do
-           !xv@(!_,!_) <- unVR (kvr s0) stopIO reqIO v0
+           !xv@(!_,!_) <- unVR (kvr s0 reqIO) stopIO reqIO v0
            IORef.atomicWriteIORef iorCache $ \s v ->
               if s == s0 && v == v0 then Just xv else Nothing
            return xv
@@ -260,7 +260,7 @@ runView (View vi0) = do
 
 mkView
   :: (MonadIO m, Eq v, Eq s)
-  => ViewInit v m (v, v -> IO (), s -> VR v r x)
+  => ViewInit v m (v, v -> IO (), s -> (r -> IO ()) -> VR v r x)
   -> View v r s m x -- ^
 mkView vi = View $ do
   (v, iovs, kvr) <- vi
@@ -269,8 +269,11 @@ mkView vi = View $ do
 
 -- Like 'mkView', except for when there is no view state, initialization nor
 -- finalization to worry about.
-mkView_ :: (Eq s, MonadIO m) => (s -> VR () r x) -> View () r s m x -- ^
-mkView_ kvr = mkView $ return ((), return, kvr)
+mkView_
+  :: (Eq s, MonadIO m)
+  => (s -> (r -> IO ()) -> x)
+  -> View () r s m x -- ^
+mkView_ kvr = mkView $ return ((), return, ((return.).) kvr)
 
 --------------------------------------------------------------------------------
 

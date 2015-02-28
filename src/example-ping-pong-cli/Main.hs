@@ -67,9 +67,7 @@ model = Lei.mkModel $ \o s -> case o of
 -- THE VIEW
 
 view :: MonadIO m => Env -> Lei.View () Req PingPongState m (IO ())
-view e = Lei.mkView_ $ \s -> do
-    req <- Lei.vrReq
-    return $ do
+view e = Lei.mkView_ $ \s req -> do
        printReport s
        envPrompter e $ do
           a <- readPingPong
