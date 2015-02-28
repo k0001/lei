@@ -31,7 +31,7 @@ module Lei
   -- * View
   , View
   , mkView
-  , mkView_
+  , mkViewSimple
   , nestView
 
   , ViewStop
@@ -269,11 +269,11 @@ mkView vi = View $ do
 
 -- Like 'mkView', except for when there is no view state, initialization nor
 -- finalization to worry about.
-mkView_
+mkViewSimple
   :: (Eq s, MonadIO m)
   => (s -> (r -> IO ()) -> x)
   -> View () r s m x -- ^
-mkView_ kvr = mkView $ return ((), return, ((return.).) kvr)
+mkViewSimple kvr = mkView $ return ((), return, ((return.).) kvr)
 
 --------------------------------------------------------------------------------
 
