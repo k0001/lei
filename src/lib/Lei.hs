@@ -10,18 +10,12 @@
 module Lei
   ( run
 
-  -- * Model
-  , Model
-  , mkModel
-  , runModel
-
   -- * Controller
   , Controller
   , mkController
 
   , C
   , req
-  , op
   , stop
   , bury
   , bury2
@@ -41,9 +35,8 @@ module Lei
   , ViewRender
 
   , VR
-  , vrStop
-  , vrRender
-  , vrState
+  , getStop
+  , render
 
   -- * Debug
   , Debug(..)
@@ -58,51 +51,41 @@ import           Control.Monad (void, unless, ap)
 import           Control.Monad.IO.Class (MonadIO(liftIO))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
 import qualified Control.Monad.State as State
-import           Data.Foldable (foldl', traverse_)
+import           Data.Foldable (traverse_)
 import           Data.Function (fix)
 import           Data.Functor.Identity (Identity(..))
 import qualified Data.IORef as IORef
 import           Data.Monoid (Monoid(..))
-import           Data.Sequence (Seq)
-import qualified Data.Sequence as Seq
 import qualified Pipes
+import           Pipes (hoist)
 import           Pipes.Core ((//>))
 import           Prelude hiding (sequence_)
-
-
---------------------------------------------------------------------------------
-
-newtype Model o s = Model { runModel :: o -> s -> s }
-
-mkModel :: (o -> s -> s) -> Model o s
-mkModel = Model
 
 --------------------------------------------------------------------------------
 
 -- | A 'Controller', constructed with 'controller', is where you deal with a
 -- concrete request of type @r@ using a given @'C' r0 o0 r o m a@.
-newtype Controller r0 o0 r o s m
-  = Controller { unController :: s -> r -> C r0 o0 r o m () }
+newtype Controller r0 r s m = Controller { unController :: r -> C r0 r s m () }
 
-instance Monad m => Monoid (Controller r0 o0 r o s m) where
-  mempty = Controller $ \_ _ -> return ()
-  mappend a b = Controller $ \s r -> unController a s r >> unController b s r
+instance Monad m => Monoid (Controller r0 r s m) where
+  mempty = Controller $ \_ -> return ()
+  mappend a b = Controller $ \r -> unController a r >> unController b r
 
-mkController :: (s -> r -> C r0 o0 r o m ()) -> Controller r0 o0 r o s m
+mkController :: (r -> C r0 r s m ()) -> Controller r0 r s m
 mkController = Controller
 
 -- | Run a 'Controller'.
 runController
   :: Monad m
-  => Controller r0 o0 r o s m
+  => Controller r0 r s m
   -> (r -> r0)
-  -> (o -> o0)
   -> s
   -> r
-  -> Pipes.Producer (Maybe r0) m (Seq o0)
-runController cer r2r0 o2o0 s r = Pipes.hoist
-    (flip State.evalStateT mempty)
-    (runC (unController cer s r) r2r0 o2o0 >> lift State.get)
+  -> Pipes.Producer (Maybe r0) m s
+runController cer r2r0 s r = hoist
+    (flip State.evalStateT s)
+    (unC (unController cer r) r2r0 >> lift State.get)
+
 
 --------------------------------------------------------------------------------
 
@@ -123,82 +106,75 @@ runController cer r2r0 o2o0 s r = Pipes.hoist
 -- 'Controller's can be nested inside a 'C' using the 'nest' and 'nest0'
 -- combinators, and actions to be executed at the current controller layer can
 -- be used by nested 'Controller's after being 'bury'ed.
-newtype C r0 o0 r o m a = C
-  { runC :: (r -> r0)
-         -> (o -> o0)
-         -> Pipes.Producer (Maybe r0) (State.StateT (Seq o0) m) a }
+newtype C r0 r s m a = C
+  { unC :: (r -> r0) -> Pipes.Producer (Maybe r0) (State.StateT s m) a }
   deriving (Functor)
 
-instance Monad m => Applicative (C r0 o0 r o m) where
-  pure a = C $ \_ _ -> pure a
-  mf <*> ma = C $ \r2r0 o2o0 ->
-      runC mf r2r0 o2o0 <*> runC ma r2r0 o2o0
+instance Monad m => Applicative (C r0 r s m) where
+  pure = return
+  (<*>) = ap
 
-instance Monad m => Monad (C r0 o0 r o m) where
-  return a = C $ \ _ _ -> return a
-  ma >>= k = C $ \r2r0 o2o0 -> do
-      a <- runC ma r2r0 o2o0
-      runC (k a) r2r0 o2o0
+instance Monad m => Monad (C r0 r s m) where
+  return a = C $ \_ -> return a
+  ma >>= k = C $ \r2r0 -> unC ma r2r0 >>= \a -> unC (k a) r2r0
 
-instance MonadTrans (C r0 o0 r o) where
-  lift ma = C $ \_ _ -> lift (lift ma)
-
-instance MonadIO m => MonadIO (C r0 o0 r o m) where
+instance MonadIO m => MonadIO (C r0 r s m) where
   liftIO = lift . liftIO
 
+instance Monad m => State.MonadState s (C r0 r s m) where
+  state k = C $ \_ -> lift (State.state k)
+
+instance MonadTrans (C r0 r s) where
+  lift ma = C $ \_ -> lift (lift ma)
+
 -- | Issue a local request for another 'Controller' to eventually handle it.
-req :: Monad m => r -> C r0 o0 r o m ()
-req r = C $ \r2r0 _ -> Pipes.yield $ Just (r2r0 r)
+req :: Monad m => r -> C r0 r s m ()
+req r = C $ \r2r0 -> Pipes.yield $ Just (r2r0 r)
 
--- | Issue a local operation for a model to update.
--- All the given operations will be applied atomically.
-op :: Monad m => o -> C r0 o0 r o m ()
-op o = C $ \_ o2o0 -> lift $ State.modify (Seq.|> o2o0 o)
-
-stop :: Monad m => C r0 o0 r o m ()
-stop = C $ \_ _ -> Pipes.yield Nothing
+stop :: Monad m => C r0 r s m ()
+stop = C $ \_ -> Pipes.yield Nothing
 
 -- | Bury a 'C' so that it can be used at a lower 'C' layer
 -- sharing the same top-level request and operation types.
 bury
   :: Monad m
-  => C r0 o0 r o m a
-  -> C r0 o0 r o m (C r0 o0 r' o' m a)
-bury c = C $ \r2r0 o2o0 -> return (C $ \_ _ -> runC c r2r0 o2o0)
+  => Lens' s' s
+  -> C r0 r s m a
+  -> C r0 r s m (C r0 r' s' m a)
+bury l c = C $ \r2r0 -> return $ C $ \_ ->
+    hoist (lensZoom l) (unC c r2r0)
 
 -- | Like 'bury' but for a function taking 2 arguments. Note that offering this
 -- is insane and we should provide just a single 'bury' combinator.
 bury2
   :: Monad m
-  => (y -> z -> C r0 o0 r o m a)
-  -> C r0 o0 r o m (y -> z -> C r0 o0 r' o' m a)
-bury2 c = C $ \r2r0 o2o0 -> return (\y z -> C $ \_ _ -> runC (c y z) r2r0 o2o0)
+  => Lens' s' s
+  -> (y -> z -> C r0 r s m a)
+  -> C r0 r s m (y -> z -> C r0 r' s' m a)
+bury2 l c = C $ \r2r0 -> return $ \y z -> C $ \_ ->
+    hoist (lensZoom l) (unC (c y z) r2r0)
 
 -- | Nest a 'Controller' compatible with the same top-level request
 -- and operation types.
 nestController
   :: Monad m
-  => s
-  -> r
+  => Lens' s' s
   -> (r -> r')
-  -> (o -> o')
-  -> Controller r0 o0 r o s m
-  -> C r0 o0 r' o' m ()
-nestController s r r2r' o2o' cer = C $ \r'2r0 o'2o0 ->
-    runC (unController cer s r) (r'2r0 . r2r') (o'2o0 . o2o')
+  -> r
+  -> Controller r0 r s m
+  -> C r0 r' s' m ()
+nestController l r2r' r cer = C $ \r'2r0 ->
+   hoist (lensZoom l) $ unC (unController cer r) (r'2r0 . r2r')
 
 -- | Nest a top-level 'Controller'.
 nestController0
   :: (Monad m, Functor m)
-  => s
+  => Lens' s' s
   -> r
-  -> Controller r o r o s m
-  -> C r0 o0 r o m ()
-nestController0 s r cer = C $ \r2r0 o2o0 -> Pipes.hoist
-    (\x -> State.StateT $ \os' -> do
-       (a, os) <- State.runStateT x mempty
-       return $ (,) a $! mappend os' (fmap o2o0 os))
-    (runC (unController cer s r) id id //> Pipes.yield . fmap r2r0)
+  -> Controller r r s m
+  -> C r0 r s' m ()
+nestController0 l r cer = C $ \r2r0 ->
+   hoist (lensZoom l) (unC (unController cer r) id //> Pipes.yield . fmap r2r0)
 
 --------------------------------------------------------------------------------
 
@@ -215,20 +191,29 @@ instance Applicative (VR v r) where
   pure = return
   (<*>) = ap
 
+-- | Warning: The 'IO' actions taking in place in 'VR' are intended to prepare
+-- the rendering result, but they are not part of the rendering result itself
+-- (i.e., the @x@ in @VR v r x@), which means they may not be executed each
+-- time the rendering result is needed. If you intend some action to be executed
+-- at the time of rendering, then return that action as the result of the @VR@
+-- action, that is, have @VR v r (IO ())@ or similar.
 instance MonadIO (VR v r) where
   liftIO m = VR $ \_ _ v -> fmap (flip (,) v) m
 
+-- | View state.
 instance State.MonadState v (VR v r) where
   state k = VR $ \_ _ v -> return (k v)
 
-vrState :: VR v r v
-vrState = State.get
+-- | Returns an action that will stop the execution of the running application
+-- when used. This is comparable to using 'stop' in a 'C'.
+--
+-- It is safe to keep, share, or call the returned action more than once.
+getStop :: VR v r (IO ())
+getStop = VR $ \a _ v -> return (a, v)
 
-vrStop :: VR v r (IO ())
-vrStop = VR $ \a _ v -> return (a, v)
-
-vrRender :: ViewRender v r s x -> s -> VR v r x
-vrRender vr s = VR $ \stopIO reqIO v -> unVR (unViewRender vr s) stopIO reqIO v
+-- | Render a view that had been previously nested using 'nestView'.
+render :: ViewRender v r s x -> s -> VR v r x
+render vr s = VR $ \stopIO reqIO v -> unVR (unViewRender vr s) stopIO reqIO v
 
 --------------------------------------------------------------------------------
 
@@ -305,24 +290,22 @@ nestView l r2r' avw = ViewInit $ do
 -- | Run a Lei application.
 --
 run
-  :: forall r o v s m a
+  :: forall r v s m a
    . (MonadIO m, Eq s)
   => (forall x y z . m x -> (x -> m y) -> (x -> m z) -> m z)
   -- ^ 'Control.Exception.bracket'-like function.
   --    Hint: use 'Control.Monad.Catch.bracket' from "Control.Monad.Catch".
-  -> (IO (Debug v r o s) -> IO a)
+  -> (IO (Debug v r s) -> IO a)
   -- ^ Loop monitoring events.
   -> s
   -- ^ Initial model state.
-  -> Model o s
-  -- ^ /Model/ update function. See 'model'.
-  -> Controller r o r o s m
+  -> Controller r r s m
   -- ^ /Controller/ issuing controller requests and model operations.
   -- See 'controller'.
   -> View v r s m (IO ())
      -- ^ /View/ issuing controller requests and rendering the model.
   -> m ()
-run bracket dbg0 s0 m cer vw = do
+run bracket dbg0 s0 cer vw = do
     -- Debug broadcast channel
     tcbDebug <- liftIO $ STM.newBroadcastTChanIO
     let dbgIO = STM.atomically . STM.writeTChan tcbDebug
@@ -345,19 +328,18 @@ run bracket dbg0 s0 m cer vw = do
               r <- liftIO $ STM.atomically $ do
                  r <- STM.readTQueue tqR
                  r <$ STM.writeTChan tcbDebug (DebugReqStart r s)
-              os <- Pipes.runEffect $ do
-                 Pipes.for (runController cer id id s r) $ \mr' -> do
+              !s' <- Pipes.runEffect $ do
+                 Pipes.for (runController cer id s r) $ \mr' -> do
                     case mr' of
                        Just r' -> liftIO $ reqIO r'
                        Nothing -> liftIO stopIO >> lift (loop s)
-              let !s' = foldl' (flip (runModel m)) s os
               liftIO $ STM.atomically $ do
                  void $ STM.tryTakeTMVar tmvSLast
                  if s == s'
                     then do STM.putTMVar tmvSLast (Left s')
-                            STM.writeTChan tcbDebug $ DebugStateSame os s'
+                            STM.writeTChan tcbDebug $ DebugStateSame s'
                     else do STM.putTMVar tmvSLast (Right s')
-                            STM.writeTChan tcbDebug $ DebugStateNew os s'
+                            STM.writeTChan tcbDebug $ DebugStateNew s'
               loop s'
     -- Render the model
     let renderLoop :: v -> ViewStop v -> ViewRender v r s (IO ()) -> IO ()
@@ -398,13 +380,13 @@ run bracket dbg0 s0 m cer vw = do
        (\a1 -> handlerLoop >> liftIO (Async.wait a1))
 
 
-data Debug v r o s
+data Debug v r s
   = DebugStopRequested
   | DebugViewInitialized v
   | DebugRenderStart v s
   | DebugReqStart r s
-  | DebugStateNew (Seq o) s
-  | DebugStateSame (Seq o) s
+  | DebugStateNew s
+  | DebugStateSame s
   deriving (Eq, Ord, Show)
 
 --------------------------------------------------------------------------------
@@ -443,3 +425,8 @@ lensSet l b = runIdentity . l (\_ -> Identity b)
 
 lensView :: Lens' s a -> s -> a
 lensView l = getConst . l Const
+
+lensZoom :: Monad m => Lens' a b -> State.StateT b m x -> State.StateT a m x
+lensZoom l sb = State.StateT $ \a -> do
+    (x, b) <- State.runStateT sb (lensView l a)
+    return (x, lensSet l b a)

@@ -45,4 +45,6 @@ executable lei-example-ping-pong-cli
       async (>=2.0 && <2.1)
     , base
     , lei
+    , lens
+    , mtl
     , transformers

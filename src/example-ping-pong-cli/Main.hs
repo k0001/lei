@@ -1,35 +1,22 @@
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Main (main) where
 
+import           Control.Lens ((.=), (%=), (-=), makeLenses)
 import           Control.Applicative
 import qualified Control.Concurrent.Async as Async
 import qualified Control.Concurrent.MVar as MVar
 import qualified Control.Exception as Ex
 import           Control.Monad (forever, forM_, guard, void)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
+import qualified Control.Monad.State as State
 import           Data.Foldable (traverse_)
 import qualified Lei
 import           Prelude
 
 --------------------------------------------------------------------------------
 -- THE MODEL
-
--- | The state of our application.
-data PingPongState = PingPongState
-  { _appStatus      :: !PingPong
-  , _appChangesLeft :: !Integer
-  , _appErrors      :: ![Error]
-  , _appStop        :: !Bool
-  } deriving (Eq, Show)
-
--- | @'def' n@ create an 'PingPongState' starting on a 'Ping' state that allows up to
--- @n@ changes, where @n > 0@.
-def :: Integer -> Maybe PingPongState
-def n = do
-    guard $ n > 0
-    return $ PingPongState Ping n [] False
-
 
 data PingPong = Ping | Pong
   deriving (Eq, Show, Read)
@@ -39,35 +26,34 @@ pingPongToggle = \case
     Ping -> Pong
     Pong -> Ping
 
-
 data Error
   = ErrorNoChangesLeft
   | ErrorCantSwap !PingPong
   deriving (Eq, Show)
 
 
--- | Operations that will, undeniably, change our 'PingPongState'.
-data Op
-  = OpAddError Error
-  | OpClearErrors
-  | OpSwapStatus
-  | OpStop
-  deriving (Show)
+-- | The state of our application.
+data Model = Model
+  { _appStatus      :: !PingPong
+  , _appChangesLeft :: !Integer
+  , _appErrors      :: ![Error]
+  , _appStop        :: !Bool
+  } deriving (Eq, Show)
 
-model :: Lei.Model Op PingPongState
-model = Lei.mkModel $ \o s -> case o of
-    OpStop -> s { _appStop = True }
-    OpAddError e -> s { _appErrors = e : _appErrors s }
-    OpClearErrors -> s { _appErrors = [] }
-    OpSwapStatus -> s { _appStatus = pingPongToggle $ _appStatus s
-                      , _appChangesLeft = _appChangesLeft s - 1
-                      }
+makeLenses ''Model
+
+-- | @'def' n@ create an 'Model' starting on a 'Ping' state that allows up to
+-- @n@ changes, where @n > 0@.
+def :: Integer -> Maybe Model
+def n = do
+    guard $ n > 0
+    return $ Model Ping n [] False
 
 --------------------------------------------------------------------------------
 -- THE VIEW
 
-view :: MonadIO m => Env -> Lei.View () Req PingPongState m (IO ())
-view e = Lei.mkView_ $ \s req -> do
+view :: MonadIO m => Env -> Lei.View () Req Model m (IO ())
+view e = Lei.mkViewSimple $ \s req -> do
        printReport s
        envPrompter e $ do
           a <- readPingPong
@@ -76,7 +62,7 @@ view e = Lei.mkView_ $ \s req -> do
     msg :: String -> IO ()
     msg a = putStrLn $ "| " ++ a
 
-    printReport :: PingPongState -> IO ()
+    printReport :: Model -> IO ()
     printReport s = do
        forM_ (_appErrors s) $ \e ->
           msg $ "ERROR: " ++ errorHumanReadable e
@@ -128,18 +114,20 @@ data Req
   | ReqSetStatus !PingPong
   deriving (Show)
 
-controller :: Monad m => Lei.Controller r0 o0 Req Op PingPongState m
-controller = Lei.mkController $ \s -> \case
-    ReqStop -> Lei.op OpStop
+controller :: Monad m => Lei.Controller r0  Req Model m
+controller = Lei.mkController $ \r -> appErrors .= [] >> case r of
+    ReqStop -> appStop .= True
     ReqSetStatus dst -> do -- TODO: MonadPlus instance for Lei.C
-      Lei.op OpClearErrors
+      s <- State.get
       let errors = concat
             [ [ErrorNoChangesLeft | _appChangesLeft s < 1]
             , [ErrorCantSwap Ping | _appStatus s /= pingPongToggle dst]
             ]
       case errors of
-        [] -> Lei.op OpSwapStatus
-        _  -> forM_ errors $ Lei.op . OpAddError
+        [] -> do
+           appStatus %= pingPongToggle
+           appChangesLeft -= 1
+        _  -> appErrors %= (errors ++)
 
 --------------------------------------------------------------------------------
 
@@ -147,7 +135,7 @@ main :: IO ()
 main = do
     Just s0 <- return $ def 5
     venv <- newEnv
-    Lei.run Ex.bracket (\_ -> return ()) s0 model controller (view venv)
+    Lei.run Ex.bracket (\_ -> return ()) s0 controller (view venv)
 
 --------------------------------------------------------------------------------
 -- Internal tools
