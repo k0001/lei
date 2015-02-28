@@ -32,10 +32,12 @@ module Lei
   , View
   , mkView
   , mkViewSimple
+
+  -- ** Initialization
+  , ViewInit
   , nestView
 
-  , ViewStop
-
+  -- ** Rendering
   , ViewRender
 
   , VR
