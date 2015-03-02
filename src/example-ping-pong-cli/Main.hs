@@ -114,7 +114,7 @@ data Req
   | ReqSetStatus !PingPong
   deriving (Show)
 
-controller :: Monad m => Lei.Controller r0  Req Model m
+controller :: Monad m => Lei.Controller r0 s0 Req Model m
 controller = Lei.mkController $ \r -> appErrors .= [] >> case r of
     ReqStop -> appStop .= True
     ReqSetStatus dst -> do -- TODO: MonadPlus instance for Lei.C
