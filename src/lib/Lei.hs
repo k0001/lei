@@ -1,10 +1,12 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE NoMonomorphismRestriction #-}
 
 -- | > import qualified Lei
 module Lei
@@ -18,9 +20,9 @@ module Lei
   , req
   , stop
   , bury
-  , bury2
+  -- , bury2
   , nestController
-  , nestController0
+  -- , nestController0
 
   -- * View
   , View
@@ -47,13 +49,13 @@ import qualified Control.Exception as Ex
 import           Control.Concurrent.MVar as MVar
 import           Control.Concurrent.Async as Async
 import qualified Control.Concurrent.STM as STM
+import           Control.Lens
 import           Control.Monad (void, unless, ap)
 import           Control.Monad.IO.Class (MonadIO(liftIO))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
 import qualified Control.Monad.State as State
 import           Data.Foldable (traverse_)
 import           Data.Function (fix)
-import           Data.Functor.Identity (Identity(..))
 import qualified Data.IORef as IORef
 import           Data.Monoid (Monoid(..))
 import qualified Pipes
@@ -65,26 +67,22 @@ import           Prelude hiding (sequence_)
 
 -- | A 'Controller', constructed with 'controller', is where you deal with a
 -- concrete request of type @r@ using a given @'C' r0 o0 r o m a@.
-newtype Controller r0 r s m = Controller { unController :: r -> C r0 r s m () }
+newtype Controller r0 s0 r s m = Controller { unController :: r -> C r0 s0 r s m () }
 
-instance Monad m => Monoid (Controller r0 r s m) where
+instance Monad m => Monoid (Controller r0 s0 r s m) where
   mempty = Controller $ \_ -> return ()
   mappend a b = Controller $ \r -> unController a r >> unController b r
 
-mkController :: (r -> C r0 r s m ()) -> Controller r0 r s m
+mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m
 mkController = Controller
 
 -- | Run a 'Controller'.
 runController
   :: Monad m
-  => Controller r0 r s m
-  -> (r -> r0)
-  -> s
+  => Controller r s r s m
   -> r
-  -> Pipes.Producer (Maybe r0) m s
-runController cer r2r0 s r = hoist
-    (flip State.evalStateT s)
-    (unC (unController cer r) r2r0 >> lift State.get)
+  -> Pipes.Producer (Maybe r) (State.StateT s m) ()
+runController cer r = unC (unController cer r) id (fmap id .)
 
 
 --------------------------------------------------------------------------------
@@ -106,75 +104,77 @@ runController cer r2r0 s r = hoist
 -- 'Controller's can be nested inside a 'C' using the 'nest' and 'nest0'
 -- combinators, and actions to be executed at the current controller layer can
 -- be used by nested 'Controller's after being 'bury'ed.
-newtype C r0 r s m a = C
-  { unC :: (r -> r0) -> Pipes.Producer (Maybe r0) (State.StateT s m) a }
+newtype C r0 s0 r s m a = C
+  { unC :: (r -> r0) -> Lens' s0 s -> Pipes.Producer (Maybe r0) (State.StateT s0 m) a }
   deriving (Functor)
 
-instance Monad m => Applicative (C r0 r s m) where
+instance Monad m => Applicative (C r0 s0 r s m) where
   pure = return
   (<*>) = ap
 
-instance Monad m => Monad (C r0 r s m) where
-  return a = C $ \_ -> return a
-  ma >>= k = C $ \r2r0 -> unC ma r2r0 >>= \a -> unC (k a) r2r0
+instance Monad m => Monad (C r0 s0 r s m) where
+  return a = C $ \_ _ -> return a
+  ma >>= k = C $ \r2r0 ls0s -> unC ma r2r0 ls0s >>= \a -> unC (k a) r2r0 ls0s
 
-instance MonadIO m => MonadIO (C r0 r s m) where
+instance MonadIO m => MonadIO (C r0 s0 r s m) where
   liftIO = lift . liftIO
 
-instance Monad m => State.MonadState s (C r0 r s m) where
-  state k = C $ \_ -> lift (State.state k)
+instance Monad m => State.MonadState s (C r0 s0 r s m) where
+  state k = C $ \_ ls0s -> lift $ zoom ls0s $ State.state k
 
-instance MonadTrans (C r0 r s) where
-  lift ma = C $ \_ -> lift (lift ma)
+instance MonadTrans (C r0 s0 r s) where
+  lift ma = C $ \_ _ -> lift (lift ma)
 
 -- | Issue a local request for another 'Controller' to eventually handle it.
-req :: Monad m => r -> C r0 r s m ()
-req r = C $ \r2r0 -> Pipes.yield $ Just (r2r0 r)
+req :: Monad m => r -> C r0 s0 r s m ()
+req r = C $ \r2r0 _ -> Pipes.yield $ Just (r2r0 r)
 
-stop :: Monad m => C r0 r s m ()
-stop = C $ \_ -> Pipes.yield Nothing
+stop :: Monad m => C r0 s0 r s m ()
+stop = C $ \_ _ -> Pipes.yield Nothing
 
 -- | Bury a 'C' so that it can be used at a lower 'C' layer
 -- sharing the same top-level request and operation types.
 bury
   :: Monad m
-  => Lens' s' s
-  -> C r0 r s m a
-  -> C r0 r s m (C r0 r' s' m a)
-bury l c = C $ \r2r0 -> return $ C $ \_ ->
-    hoist (lensZoom l) (unC c r2r0)
+  => C r0 s0 r s m a
+  -> C r0 s0 r s m (C r0 s0 r' s' m a)
+bury c = C $ \r2r0 ls0s -> return $ C $ \_ _ -> unC c r2r0 ls0s
 
 -- | Like 'bury' but for a function taking 2 arguments. Note that offering this
 -- is insane and we should provide just a single 'bury' combinator.
-bury2
-  :: Monad m
-  => Lens' s' s
-  -> (y -> z -> C r0 r s m a)
-  -> C r0 r s m (y -> z -> C r0 r' s' m a)
-bury2 l c = C $ \r2r0 -> return $ \y z -> C $ \_ ->
-    hoist (lensZoom l) (unC (c y z) r2r0)
+-- bury2
+--   :: Monad m
+--   => Lens' s' s
+--   -> (y -> z -> C r0 r s m a)
+--   -> C r0 r s m (y -> z -> C r0 r' s' m a)
+-- bury2 l c = C $ \r2r0 -> return $ \y z -> C $ \_ ->
+--     hoist (zoom l) (unC (c y z) r2r0)
 
 -- | Nest a 'Controller' compatible with the same top-level request
 -- and operation types.
 nestController
-  :: Monad m
-  => Lens' s' s
-  -> (r -> r')
-  -> r
-  -> Controller r0 r s m
-  -> C r0 r' s' m ()
-nestController l r2r' r cer = C $ \r'2r0 ->
-   hoist (lensZoom l) $ unC (unController cer r) (r'2r0 . r2r')
+  :: forall m s0 r0 s r s' r'
+   . Monad m
+  => (forall f. Applicative f => LensLike' f s s') -- TODO: test that this does the right thing
+  -> (r' -> r)
+  -> r'
+  -> Controller r0 s0 r' s' m
+  -> C r0 s0 r s m ()
+nestController oss' r'2r r' cer = C $ \r2r0 ls0s -> do
+   let its0s' = indexing (ls0s . oss')
+   s0 <- State.get
+   iforOf_ its0s' s0 $ \i _ ->
+      unC (unController cer r') (r2r0 . r'2r) (singular (elementOf its0s' i))
 
--- | Nest a top-level 'Controller'.
-nestController0
-  :: (Monad m, Functor m)
-  => Lens' s' s
-  -> r
-  -> Controller r r s m
-  -> C r0 r s' m ()
-nestController0 l r cer = C $ \r2r0 ->
-   hoist (lensZoom l) (unC (unController cer r) id //> Pipes.yield . fmap r2r0)
+-- -- | Nest a top-level 'Controller'.
+-- nestController0
+--   :: (Monad m, Functor m)
+--   => Lens' s' s
+--   -> r
+--   -> Controller r r s m
+--   -> C r0 r s' m ()
+-- nestController0 l r cer = C $ \r2r0 ->
+--    hoist (zoom l) (unC (unController cer r) id //> Pipes.yield . fmap r2r0)
 
 --------------------------------------------------------------------------------
 
@@ -278,11 +278,11 @@ nestView
  -> ViewInit v' m (v, ViewRender v' r' s x)
 nestView l r2r' avw = ViewInit $ do
    (av, avs, avrr) <- lift $ runView avw
-   State.modify $ mappend (contramapViewStop (lensView l) avs)
+   State.modify $ mappend (contramapViewStop (view l) avs)
    let vrr = ViewRender $ \s0 -> VR $ \stopIO reqIO v' -> do
-               let v1 = lensView l v'
+               let v1 = view l v'
                (x, v2) <- unVR (unViewRender avrr s0) stopIO (reqIO . r2r') v1
-               return (x, lensSet l v2 v')
+               return (x, set l v2 v')
    return (av, vrr)
 
 --------------------------------------------------------------------------------
@@ -299,7 +299,7 @@ run
   -- ^ Loop monitoring events.
   -> s
   -- ^ Initial model state.
-  -> Controller r r s m
+  -> Controller r s r s m
   -- ^ /Controller/ issuing controller requests and model operations.
   -- See 'controller'.
   -> View v r s m (IO ())
@@ -328,11 +328,11 @@ run bracket dbg0 s0 cer vw = do
               r <- liftIO $ STM.atomically $ do
                  r <- STM.readTQueue tqR
                  r <$ STM.writeTChan tcbDebug (DebugReqStart r s)
-              !s' <- Pipes.runEffect $ do
-                 Pipes.for (runController cer id s r) $ \mr' -> do
+              !s' <- flip State.execStateT s $ Pipes.runEffect $ do
+                 Pipes.for (runController cer r) $ \mr' -> do
                     case mr' of
                        Just r' -> liftIO $ reqIO r'
-                       Nothing -> liftIO stopIO >> lift (loop s)
+                       Nothing -> liftIO stopIO >> lift (lift (loop s))
               liftIO $ STM.atomically $ do
                  void $ STM.tryTakeTMVar tmvSLast
                  if s == s'
@@ -414,19 +414,3 @@ instance Monoid (ViewStop v) where
 
 contramapViewStop :: (a -> b) -> ViewStop b -> ViewStop a
 contramapViewStop f x = mkViewStop $ runViewStop x . f
-
---------------------------------------------------------------------------------
--- The wheel, mon ami, it is necessary to reinvent it.
-
-type Lens' s a = forall f. Functor f => (a -> f a) -> s -> f s
-
-lensSet :: Lens' s a -> a -> s -> s
-lensSet l b = runIdentity . l (\_ -> Identity b)
-
-lensView :: Lens' s a -> s -> a
-lensView l = getConst . l Const
-
-lensZoom :: Monad m => Lens' a b -> State.StateT b m x -> State.StateT a m x
-lensZoom l sb = State.StateT $ \a -> do
-    (x, b) <- State.runStateT sb (lensView l a)
-    return (x, lensSet l b a)
