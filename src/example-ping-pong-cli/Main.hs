@@ -114,8 +114,10 @@ data Req
   | ReqSetStatus !PingPong
   deriving (Show)
 
-controller :: Monad m => Lei.Controller r0 s0 Req Model m
-controller = Lei.mkController $ \r -> appErrors .= [] >> case r of
+controller :: MonadIO m => Lei.Controller r0 s0 Req Model m
+controller = Lei.mkController $ \r -> do
+  appErrors .= []
+  case r of
     ReqStop -> appStop .= True
     ReqSetStatus dst -> do -- TODO: MonadPlus instance for Lei.C
       s <- State.get

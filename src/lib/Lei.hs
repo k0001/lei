@@ -50,9 +50,10 @@ import           Control.Concurrent.MVar as MVar
 import           Control.Concurrent.Async as Async
 import qualified Control.Concurrent.STM as STM
 import           Control.Lens
-import           Control.Monad (void, unless, ap)
+import           Control.Monad (join, void, unless, ap, (<=<))
 import           Control.Monad.IO.Class (MonadIO(liftIO))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
+import           Control.Monad.Trans.Maybe (MaybeT(MaybeT), runMaybeT)
 import qualified Control.Monad.State as State
 import           Data.Foldable (traverse_)
 import           Data.Function (fix)
@@ -62,6 +63,8 @@ import qualified Pipes
 import           Pipes (hoist)
 import           Pipes.Core ((//>))
 import           Prelude hiding (sequence_)
+
+import Debug.Trace
 
 --------------------------------------------------------------------------------
 
@@ -82,7 +85,8 @@ runController
   => Controller r s r s m
   -> r
   -> Pipes.Producer (Maybe r) (State.StateT s m) ()
-runController cer r = unC (unController cer r) id (fmap id .)
+runController cer r =
+    void $ runMaybeT $ runC (unController cer r) id (Just . id) const
 
 
 --------------------------------------------------------------------------------
@@ -105,32 +109,57 @@ runController cer r = unC (unController cer r) id (fmap id .)
 -- combinators, and actions to be executed at the current controller layer can
 -- be used by nested 'Controller's after being 'bury'ed.
 newtype C r0 s0 r s m a = C
-  { unC :: (r -> r0) -> Lens' s0 s -> Pipes.Producer (Maybe r0) (State.StateT s0 m) a }
-  deriving (Functor)
+  (    (r -> r0)
+    -> (s0 -> Maybe s) -- ^ A “getter”.
+    -> (s -> s0 -> s0) -- ^ A “setter”. It is OK to leave @s0@ untouched if @s@
+                       --   has no place in it.
+    -> MaybeT (Pipes.Producer (Maybe r0) (State.StateT s0 m)) a
+  ) deriving (Functor)
+
+runC
+  :: Monad m
+  => C r0 s0 r s m a
+  -> (r -> r0)
+  -> (s0 -> Maybe s)
+  -> (s -> s0 -> s0)
+  -> MaybeT (Pipes.Producer (Maybe r0) (State.StateT s0 m)) a
+runC (C f) r2r0 gs0s ss0s = do
+  s0 <- State.get
+  case gs0s s0 of
+     Nothing -> MaybeT (return Nothing)
+     Just _  -> f r2r0 gs0s ss0s
+{-# INLINE runC #-}
 
 instance Monad m => Applicative (C r0 s0 r s m) where
   pure = return
   (<*>) = ap
 
 instance Monad m => Monad (C r0 s0 r s m) where
-  return a = C $ \_ _ -> return a
-  ma >>= k = C $ \r2r0 ls0s -> unC ma r2r0 ls0s >>= \a -> unC (k a) r2r0 ls0s
+  return a = C $ \_ _ _ -> return a
+  ma >>= k = C $ \r2r0 gs0s ss0s -> do
+      a <- runC ma r2r0 gs0s ss0s
+      runC (k a) r2r0 gs0s ss0s
 
 instance MonadIO m => MonadIO (C r0 s0 r s m) where
   liftIO = lift . liftIO
 
 instance Monad m => State.MonadState s (C r0 s0 r s m) where
-  state k = C $ \_ ls0s -> lift $ zoom ls0s $ State.state k
+  state k = C $ \_ gs0s ss0s -> MaybeT $ lift $ State.state $ \s0 ->
+    case gs0s s0 of
+       Nothing -> (Nothing, s0)
+       Just s  -> let !(a, !s') = k s in (Just a, ss0s s' s0)
 
 instance MonadTrans (C r0 s0 r s) where
-  lift ma = C $ \_ _ -> lift (lift ma)
+  lift ma = C $ \_ _ _ -> lift (lift (lift ma))
 
 -- | Issue a local request for another 'Controller' to eventually handle it.
 req :: Monad m => r -> C r0 s0 r s m ()
-req r = C $ \r2r0 _ -> Pipes.yield $ Just (r2r0 r)
+req r = C $ \r2r0 _ _ -> lift $ Pipes.yield $ Just (r2r0 r)
+{-# INLINABLE req #-}
 
 stop :: Monad m => C r0 s0 r s m ()
-stop = C $ \_ _ -> Pipes.yield Nothing
+stop = C $ \_ _ _ -> lift $ Pipes.yield Nothing
+{-# INLINABLE stop #-}
 
 -- | Bury a 'C' so that it can be used at a lower 'C' layer
 -- sharing the same top-level request and operation types.
@@ -138,7 +167,8 @@ bury
   :: Monad m
   => C r0 s0 r s m a
   -> C r0 s0 r s m (C r0 s0 r' s' m a)
-bury c = C $ \r2r0 ls0s -> return $ C $ \_ _ -> unC c r2r0 ls0s
+bury c = C $ \r2r0 gs0s ss0s -> return $ C $ \_ _ _ -> runC c r2r0 gs0s ss0s
+{-# INLINABLE bury #-}
 
 -- | Like 'bury' but for a function taking 2 arguments. Note that offering this
 -- is insane and we should provide just a single 'bury' combinator.
@@ -148,23 +178,33 @@ bury c = C $ \r2r0 ls0s -> return $ C $ \_ _ -> unC c r2r0 ls0s
 --   -> (y -> z -> C r0 r s m a)
 --   -> C r0 r s m (y -> z -> C r0 r' s' m a)
 -- bury2 l c = C $ \r2r0 -> return $ \y z -> C $ \_ ->
---     hoist (zoom l) (unC (c y z) r2r0)
+--     hoist (zoom l) (runC (c y z) r2r0)
 
 -- | Nest a 'Controller' compatible with the same top-level request
 -- and operation types.
 nestController
   :: forall m s0 r0 s r s' r'
    . Monad m
-  => (forall f. Applicative f => LensLike' f s s') -- TODO: test that this does the right thing
+  => (s -> Maybe s') -- ^ A “getter”. TODO: Ideally I want to take a Traversal
+                     --   here, and for each target, run the nested controller.
+                     --   However, to do that, it seems I need to be able to
+                     --   convert a Traversal targeting N elements to N
+                     --   Traversals targeting 1 element. See some hints at
+                     --   https://github.com/ekmett/lens/issues/252
+  -> (s' -> s -> s)  -- ^ A “setter”. Same comment as above. It is OK for this
+                     --   setter to leave the given @s@ untouched if the @s'@
+                     --   has no place in it.
   -> (r' -> r)
   -> r'
   -> Controller r0 s0 r' s' m
   -> C r0 s0 r s m ()
-nestController oss' r'2r r' cer = C $ \r2r0 ls0s -> do
-   let its0s' = indexing (ls0s . oss')
-   s0 <- State.get
-   iforOf_ its0s' s0 $ \i _ ->
-      unC (unController cer r') (r2r0 . r'2r) (singular (elementOf its0s' i))
+nestController gss' sss' r'2r r' cer = C $ \r2r0 gs0s ss0s -> do
+    runC (unController cer r')
+         (r2r0 . r'2r)
+         (gss' <=< gs0s)
+         (\s' s0 -> case gs0s s0 of
+             Nothing -> s0
+             Just s  -> ss0s (sss' s' s) s0)
 
 -- -- | Nest a top-level 'Controller'.
 -- nestController0
@@ -174,7 +214,7 @@ nestController oss' r'2r r' cer = C $ \r2r0 ls0s -> do
 --   -> Controller r r s m
 --   -> C r0 r s' m ()
 -- nestController0 l r cer = C $ \r2r0 ->
---    hoist (zoom l) (unC (unController cer r) id //> Pipes.yield . fmap r2r0)
+--    hoist (zoom l) (runC (unController cer r) id //> Pipes.yield . fmap r2r0)
 
 --------------------------------------------------------------------------------
 
