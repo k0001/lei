@@ -50,10 +50,9 @@ import           Control.Concurrent.MVar as MVar
 import           Control.Concurrent.Async as Async
 import qualified Control.Concurrent.STM as STM
 import           Control.Lens
-import           Control.Monad (void, unless, ap, MonadPlus(mzero, mplus))
+import           Control.Monad (void, unless, ap)
 import           Control.Monad.IO.Class (MonadIO(liftIO))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
-import           Control.Monad.Trans.Maybe (MaybeT(MaybeT), runMaybeT)
 import qualified Control.Monad.State as State
 import           Data.Foldable (traverse_)
 import           Data.Function (fix)
@@ -83,7 +82,7 @@ runController
   => Controller r s r s m
   -> r
   -> Pipes.Producer (Maybe r) (State.StateT s m) ()
-runController cer r = void $ runMaybeT $ unC (unController cer r) id (fmap id .)
+runController cer r = unC (unController cer r) id (fmap id .)
 
 
 --------------------------------------------------------------------------------
@@ -106,57 +105,32 @@ runController cer r = void $ runMaybeT $ unC (unController cer r) id (fmap id .)
 -- combinators, and actions to be executed at the current controller layer can
 -- be used by nested 'Controller's after being 'bury'ed.
 newtype C r0 s0 r s m a = C
-  { unC :: (r -> r0)
-        -> Traversal' s0 s -- Guaranteed to point to 0 or 1 locations.
-        -> MaybeT (Pipes.Producer (Maybe r0) (State.StateT s0 m)) a }
+  { unC :: (r -> r0) -> Lens' s0 s -> Pipes.Producer (Maybe r0) (State.StateT s0 m) a }
   deriving (Functor)
 
 instance Monad m => Applicative (C r0 s0 r s m) where
   pure = return
   (<*>) = ap
 
-instance (Functor m, Monad m) => Alternative (C r0 s0 r s m) where
-  empty = C $ \_ _ -> empty
-  ma <|> mb = C $ \r2r0 ls0s -> unC ma r2r0 ls0s <|> unC mb r2r0 ls0s
-
-instance (Functor m, Monad m) => MonadPlus (C r0 s0 r s m) where
-  mzero = empty
-  mplus = (<|>)
-
 instance Monad m => Monad (C r0 s0 r s m) where
   return a = C $ \_ _ -> return a
-  ma >>= k = C $ \r2r0 ls0s -> do
-     -- `State.get` prevents running `ma` if the `s` is absent.
-     a <- unC (State.get >> ma) r2r0 ls0s
-     -- `State.get` prevents running `k a` if the `s` is absent.
-     unC (State.get >> k a) r2r0 ls0s
+  ma >>= k = C $ \r2r0 ls0s -> unC ma r2r0 ls0s >>= \a -> unC (k a) r2r0 ls0s
 
 instance MonadIO m => MonadIO (C r0 s0 r s m) where
   liftIO = lift . liftIO
 
 instance Monad m => State.MonadState s (C r0 s0 r s m) where
-  state k =  C $ \_ ts0s -> MaybeT $ lift $ State.StateT $ \s0 ->
-     case preview ts0s s0 of
-        Nothing -> return (Nothing, s0)
-        Just s  -> do
-          if lengthOf ts0s s0 == 1
-             then do
-                let (a, s') = k s
-                return (Just a, set ts0s s' s0)
-             else
-                -- `nestController` ensures that this never happens. But just
-                -- in case it ever does, we add this error here.
-                error "Lei.cModify: traversal targets more than one element"
+  state k = C $ \_ ls0s -> lift $ zoom ls0s $ State.state k
 
 instance MonadTrans (C r0 s0 r s) where
-  lift ma = C $ \_ _ -> lift (lift (lift ma))
+  lift ma = C $ \_ _ -> lift (lift ma)
 
 -- | Issue a local request for another 'Controller' to eventually handle it.
 req :: Monad m => r -> C r0 s0 r s m ()
-req r = C $ \r2r0 _ -> lift $ Pipes.yield $ Just (r2r0 r)
+req r = C $ \r2r0 _ -> Pipes.yield $ Just (r2r0 r)
 
 stop :: Monad m => C r0 s0 r s m ()
-stop = C $ \_ _ -> lift $ Pipes.yield Nothing
+stop = C $ \_ _ -> Pipes.yield Nothing
 
 -- | Bury a 'C' so that it can be used at a lower 'C' layer
 -- sharing the same top-level request and operation types.
