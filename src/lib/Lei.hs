@@ -1,5 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -7,9 +9,63 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | > import qualified Lei
+-- | /Lei/ allows you to organize MVC applications in which:
+--
+-- * A single MVC application can be split to many MVC components, each
+--   consisting of a controller, possibly a model state, and zero or more views.
+--
+-- * The model state is kept globally.
+--
+-- * Controllers take a request, interact with the real world, and then change
+--   the model state.
+--
+-- * Controllers handling the same request type can be composed using 'mappend'.
+--
+-- * Controllers handling different request types or working with different
+--   model states can be nested and can communicate with each other
+--   bidirectionally.
+--
+-- * Views render the model state.
+--
+-- * Views can render things other than 'IO' actions.
+--
+-- * Views have their own state which is also kept globally and can also be
+--   nested.
+--
+-- * Views render only if the model state has changed.
+--
+-- * Views have their own initialization and deinitialization routines.
+--
+-- * Views can be nested, and their rendering results can be composed in any
+--   way their types allow it.
+--
+-- * The changes to the state of the application can be monitored.
+--
+-- This module is intended to be imported this way:
+--
+-- > import qualified Lei
+--
+-- There are a lot of free type variables seen in this documentation, but all of
+-- them follow the same naming convention. Here is a reference to keep handy
+-- while you familiarize yourself with Lei:
+--
+-- * @s @: the model state type at the current 'Controller' or 'View' layer.
+--
+-- * @s0@: the top-level model state type.
+--
+-- * @r @: the request type at the current 'Controller' or 'View' layer,
+--   to be handled by a compatible 'Controller'.
+--
+-- * @r0@: the top-level request state, to be handled by the top-level
+--   'Controller'.
+--
+-- * @v @: the 'View' state type at the current 'View' layer.
+--
+-- * @m @: the monad where the 'Controller's and the 'ViewInit's run.
 module Lei
-  ( run
+  ( -- * Running a Lei application
+    runSimple
+  , run
 
   -- * Controller
   , Controller
@@ -54,10 +110,13 @@ import           Control.Monad.IO.Class (MonadIO(liftIO))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
 import           Control.Monad.Trans.Maybe (MaybeT(MaybeT), runMaybeT)
 import qualified Control.Monad.State as State
+import           Data.Data (Data)
 import           Data.Foldable (traverse_)
 import           Data.Function (fix)
 import qualified Data.IORef as IORef
 import           Data.Monoid (Monoid(..))
+import           Data.Typeable (Typeable)
+import           GHC.Generics (Generic)
 import qualified Pipes
 import           Pipes.Core ((//>))
 import           Prelude hiding (sequence_)
@@ -69,11 +128,12 @@ import           Prelude hiding (sequence_)
 -- concrete request of type @r@ using a given @'C' r0 o0 r o m a@.
 newtype Controller r0 s0 r s m = Controller { unController :: r -> C r0 s0 r s m () }
 
+-- | @'mappend' a b@: First @a@ handles @r@, and then @b@ handles the same @r@.
 instance Monad m => Monoid (Controller r0 s0 r s m) where
   mempty = Controller $ \_ -> return ()
   mappend a b = Controller $ \r -> unController a r >> unController b r
 
-mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m
+mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m -- ^
 mkController = Controller
 
 runController
@@ -111,9 +171,9 @@ runController cer r =
 -- controller layer can be used by nested 'Controller's after being 'bury'ed.
 newtype C r0 s0 r s m a = C
   (    (r -> r0)
-    -> (s0 -> Maybe s) -- ^ A “getter”.
-    -> (s -> s0 -> s0) -- ^ A “setter”. It is OK to leave @s0@ untouched if @s@
-                       --   has no place in it.
+    -> (s0 -> Maybe s) -- A getter.
+    -> (s -> s0 -> s0) -- A setter. It is OK to leave @s0@ untouched if @s@
+                       -- has no place in it.
     -> MaybeT (State.StateT s0 (Pipes.Producer (Maybe r0) m)) a
   ) deriving (Functor)
 
@@ -167,7 +227,7 @@ stop = C $ \_ _ _ -> lift $ lift $ Pipes.yield Nothing
 bury
   :: Monad m
   => C r0 s0 r s m a
-  -> C r0 s0 r s m (C r0 s0 r' s' m a)
+  -> C r0 s0 r s m (C r0 s0 r' s' m a) -- ^
 bury c = C $ \r2r0 gs0s ss0s -> return $ C $ \_ _ _ -> runC c r2r0 gs0s ss0s
 {-# INLINABLE bury #-}
 
@@ -177,17 +237,26 @@ bury c = C $ \r2r0 gs0s ss0s -> return $ C $ \_ _ _ -> runC c r2r0 gs0s ss0s
 bury2
   :: Monad m
   => (y -> z -> C r0 s0 r s m a)
-  -> C r0 s0 r s m (y -> z -> C r0 s0 r' s' m a)
+  -> C r0 s0 r s m (y -> z -> C r0 s0 r' s' m a) -- ^
 bury2 c = C $ \r2r0 gs0s ss0s -> return $ \y z -> C $ \_ _ _ ->
     runC (c y z) r2r0 gs0s ss0s
 
 -- | Nest a 'Controller' compatible with the same top-level request and
 -- model state types.
+--
+-- Note: using 'nestController0' not only you can obtain a 'C' that can be
+-- used inline within other 'Controller', but also you can create a
+-- 'Controller' itself that you can then combine with other controller
+-- using 'mappend':
+--
+-- @
+-- mappend (mkController (nestController a b c)) myOtherController
+-- @
 nestController
-  :: forall m s0 r0 s r s' r'
-   . Monad m
-  => (s -> Maybe s', s' -> s -> s)
-  -- ^ A “getter” and a “setter”. It is OK for this setter to leave the given
+  :: Monad m
+  => Controller r0 s0 r' s' m
+  -> (s -> Maybe s', s' -> s -> s)
+  -- ^ A getter and a setter. It is OK for this setter to leave the given
   -- @s@ untouched if the @s'@  has no place in it. TODO: Ideally I want to take
   -- a Traversal here, and for each target, run the nested controller. However,
   -- to do that, it seems I need to be able to convert a Traversal targeting N
@@ -195,9 +264,8 @@ nestController
   -- See some hints at https://github.com/ekmett/lens/issues/252
   -> (r' -> r)
   -> r'
-  -> Controller r0 s0 r' s' m
   -> C r0 s0 r s m ()
-nestController (gss', sss') r'2r r' cer = C $ \r2r0 gs0s ss0s -> do
+nestController cer (gss', sss') r'2r r' = C $ \r2r0 gs0s ss0s -> do
     runC (unController cer r')
          (r2r0 . r'2r)
          (gss' <=< gs0s)
@@ -205,15 +273,15 @@ nestController (gss', sss') r'2r r' cer = C $ \r2r0 gs0s ss0s -> do
              Nothing -> s0
              Just s  -> ss0s (sss' s' s) s0)
 
--- | Nest a top-level 'Controller'.
+-- | Like 'nestController', but for nesting a top-level 'Controller'.
 nestController0
   :: (Monad m, Functor m)
-  => (s -> Maybe s', s' -> s -> s)
+  => Controller r' s' r' s' m
+  -> (s -> Maybe s', s' -> s -> s)
   -> (r' -> r)
   -> r'
-  -> Controller r' s' r' s' m
-  -> C r0 s0 r s m ()
-nestController0 (gss', sss') r'2r r' cer =
+  -> C r0 s0 r s m () -- ^
+nestController0 cer (gss', sss') r'2r r' =
     C $ \r2r0 gs0s ss0s -> MaybeT $ State.StateT $ \s0 -> do
        let ms' = gss' =<< gs0s s0
            ss0s' = \s' -> case gs0s s0 of
@@ -257,7 +325,8 @@ instance State.MonadState v (VR v r) where
 -- | Returns an action that will stop the execution of the running application
 -- when used. This is comparable to using 'stop' in a 'C'.
 --
--- It is safe to keep, share, or call the returned action more than once.
+-- It is safe to keep, share, or call the returned action more than once; it
+-- is valid during the whole execution of the Lei application.
 getStop :: VR v r (IO ())
 getStop = VR $ \a _ v -> return (a, v)
 
@@ -298,7 +367,16 @@ runView (View vi0) = do
 mkView
   :: (MonadIO m, Eq v, Eq s)
   => ViewInit v m (v, v -> IO (), s -> (r -> IO ()) -> VR v r x)
-  -> View v r s m x -- ^
+  -- ^ @v@: view state.
+  --
+  --   @v -> 'IO' ()@: release resources acquired by 'ViewInit'.
+  --
+  --   @s@: model state to render.
+  --
+  --   @r -> 'IO' ()@: issue a request.
+  --
+  --   @x@: rendering result.
+  -> View v r s m x
 mkView vi = View $ do
   (v, iovs, kvr) <- vi
   vr <- liftIO $ mkViewRenderCacheLast kvr
@@ -308,8 +386,12 @@ mkView vi = View $ do
 -- finalization to worry about.
 mkViewSimple
   :: (Eq s, MonadIO m)
-  => (s -> (r -> IO ()) -> x)
-  -> View () r s m x -- ^
+  => (s -> (r -> IO ()) -> x) -- ^ @s@: state to render.
+                              --
+                              --   @r -> 'IO' ()@: issue a request.
+                              --
+                              --   @x@: rendering result.
+  -> View () r s m x
 mkViewSimple kvr = mkView $ return ((), return, ((return.).) kvr)
 
 --------------------------------------------------------------------------------
@@ -325,7 +407,7 @@ nestView
  => Lens' v' v
  -> (r -> r')
  -> View v r s m x
- -> ViewInit v' m (v, ViewRender v' r' s x)
+ -> ViewInit v' m (v, ViewRender v' r' s x) -- ^
 nestView l r2r' avw = ViewInit $ do
    (av, avs, avrr) <- lift $ runView avw
    State.modify $ mappend (contramapViewStop (view l) avs)
@@ -337,8 +419,22 @@ nestView l r2r' avw = ViewInit $ do
 
 --------------------------------------------------------------------------------
 
+
+-- | Like 'run', but assumes that the application runs in 'IO' and doesn't
+-- provide any monitoring capabilities.
+runSimple
+  :: Eq s
+  => s
+  -- ^ Initial /Model/ state.
+  -> Controller r s r s IO
+  -- ^ /Controller/ issuing controller requests and model operations.
+  -> View v r s IO (IO ())
+  -- ^ /View/ issuing controller requests and rendering the model.
+  -> IO ()
+runSimple = run Ex.bracket (\_ -> return ())
+
+
 -- | Run a Lei application.
---
 run
   :: forall r v s m a
    . (MonadIO m, Eq s)
@@ -348,7 +444,7 @@ run
   -> (IO (Debug v r s) -> IO a)
   -- ^ Loop monitoring events.
   -> s
-  -- ^ Initial model state.
+  -- ^ Initial /Model/ state.
   -> Controller r s r s m
   -- ^ /Controller/ issuing controller requests and model operations.
   -- See 'controller'.
@@ -437,7 +533,7 @@ data Debug v r s
   | DebugReqStart r s
   | DebugStateNew s
   | DebugStateSame s
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord, Show, Data, Typeable, Generic)
 
 --------------------------------------------------------------------------------
 -- Internal tools
