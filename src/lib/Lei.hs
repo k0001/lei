@@ -20,9 +20,9 @@ module Lei
   , req
   , stop
   , bury
-  -- , bury2
+  , bury2
   , nestController
-  -- , nestController0
+  , nestController0
 
   -- * View
   , View
@@ -50,7 +50,7 @@ import           Control.Concurrent.MVar as MVar
 import           Control.Concurrent.Async as Async
 import qualified Control.Concurrent.STM as STM
 import           Control.Lens
-import           Control.Monad (join, void, unless, ap, (<=<))
+import           Control.Monad (void, unless, ap, (<=<))
 import           Control.Monad.IO.Class (MonadIO(liftIO))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
 import           Control.Monad.Trans.Maybe (MaybeT(MaybeT), runMaybeT)
@@ -60,11 +60,9 @@ import           Data.Function (fix)
 import qualified Data.IORef as IORef
 import           Data.Monoid (Monoid(..))
 import qualified Pipes
-import           Pipes (hoist)
 import           Pipes.Core ((//>))
 import           Prelude hiding (sequence_)
 
-import Debug.Trace
 
 --------------------------------------------------------------------------------
 
@@ -79,22 +77,22 @@ instance Monad m => Monoid (Controller r0 s0 r s m) where
 mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m
 mkController = Controller
 
--- | Run a 'Controller'.
 runController
   :: Monad m
   => Controller r s r s m
   -> r
-  -> Pipes.Producer (Maybe r) (State.StateT s m) ()
+  -> s
+  -> Pipes.Producer (Maybe r) m s
 runController cer r =
-    void $ runMaybeT $ runC (unController cer r) id (Just . id) const
+   State.execStateT $ runMaybeT $ runC (unController cer r) id (Just . id) const
 
 
 --------------------------------------------------------------------------------
 
--- | A @'C' r0 o0 r o m a@ is where you can issue requests of type @r@ and
--- operations of type @o@, within a larger context of top-level requests of type
--- @r0@ possibly leading to the issue of top-level operations of type @o0@'. A
--- 'C' where the top-level request and operation types match the request
+-- | A @'C' r0 s0 r s m a@ is where you can issue requests of type @r@ and
+-- modify a model state of type @s@, within a larger context of top-level
+-- requests of type @r0@ and a top-level model state of type @s0@'. A
+-- 'C' where the top-level request and model state types match the request
 -- and operation types of the current layer is said to be a top-level 'C'.
 -- A 'C' needs be converted into a 'Controller' using 'controller' before
 -- it can be used as (or as part of) a top-level 'Controller'.
@@ -102,18 +100,22 @@ runController cer r =
 -- * A request is delivered asyncrhonously for another 'Controller' to
 --   eventually c it. You use 'req' to issue a request.
 --
--- * An operation is delivered synchronously for a model to update. You use 'op'
---   to issue an operation.
+-- * Changes to the model state happen atomically when the 'Controller' runs.
 --
--- 'Controller's can be nested inside a 'C' using the 'nest' and 'nest0'
--- combinators, and actions to be executed at the current controller layer can
--- be used by nested 'Controller's after being 'bury'ed.
+-- * A 'C' (and thus, a 'Controller'), runs until it finishes on its own or
+--   until the model state can't be found on the top-level state anymore.
+--   This allows top-level 'Controller' to alter their state without causing
+--   child controllers to fail.
+--
+-- 'Controller's can be nested inside a 'C' using the 'nestController' and
+-- 'nestController0' combinators, and actions to be executed at the current
+-- controller layer can be used by nested 'Controller's after being 'bury'ed.
 newtype C r0 s0 r s m a = C
   (    (r -> r0)
     -> (s0 -> Maybe s) -- ^ A “getter”.
     -> (s -> s0 -> s0) -- ^ A “setter”. It is OK to leave @s0@ untouched if @s@
                        --   has no place in it.
-    -> MaybeT (Pipes.Producer (Maybe r0) (State.StateT s0 m)) a
+    -> MaybeT (State.StateT s0 (Pipes.Producer (Maybe r0) m)) a
   ) deriving (Functor)
 
 runC
@@ -122,7 +124,7 @@ runC
   -> (r -> r0)
   -> (s0 -> Maybe s)
   -> (s -> s0 -> s0)
-  -> MaybeT (Pipes.Producer (Maybe r0) (State.StateT s0 m)) a
+  -> MaybeT (State.StateT s0 (Pipes.Producer (Maybe r0) m)) a
 runC (C f) r2r0 gs0s ss0s = do
   s0 <- State.get
   case gs0s s0 of
@@ -144,7 +146,7 @@ instance MonadIO m => MonadIO (C r0 s0 r s m) where
   liftIO = lift . liftIO
 
 instance Monad m => State.MonadState s (C r0 s0 r s m) where
-  state k = C $ \_ gs0s ss0s -> MaybeT $ lift $ State.state $ \s0 ->
+  state k = C $ \_ gs0s ss0s -> MaybeT $ State.state $ \s0 ->
     case gs0s s0 of
        Nothing -> (Nothing, s0)
        Just s  -> let !(a, !s') = k s in (Just a, ss0s s' s0)
@@ -154,11 +156,11 @@ instance MonadTrans (C r0 s0 r s) where
 
 -- | Issue a local request for another 'Controller' to eventually handle it.
 req :: Monad m => r -> C r0 s0 r s m ()
-req r = C $ \r2r0 _ _ -> lift $ Pipes.yield $ Just (r2r0 r)
+req r = C $ \r2r0 _ _ -> lift $ lift $ Pipes.yield $ Just (r2r0 r)
 {-# INLINABLE req #-}
 
 stop :: Monad m => C r0 s0 r s m ()
-stop = C $ \_ _ _ -> lift $ Pipes.yield Nothing
+stop = C $ \_ _ _ -> lift $ lift $ Pipes.yield Nothing
 {-# INLINABLE stop #-}
 
 -- | Bury a 'C' so that it can be used at a lower 'C' layer
@@ -170,35 +172,33 @@ bury
 bury c = C $ \r2r0 gs0s ss0s -> return $ C $ \_ _ _ -> runC c r2r0 gs0s ss0s
 {-# INLINABLE bury #-}
 
--- | Like 'bury' but for a function taking 2 arguments. Note that offering this
--- is insane and we should provide just a single 'bury' combinator.
--- bury2
---   :: Monad m
---   => Lens' s' s
---   -> (y -> z -> C r0 r s m a)
---   -> C r0 r s m (y -> z -> C r0 r' s' m a)
--- bury2 l c = C $ \r2r0 -> return $ \y z -> C $ \_ ->
---     hoist (zoom l) (runC (c y z) r2r0)
+-- | Like 'bury' but for a function taking 2 arguments.
+--
+-- TODO: Not offer this, we should provide just a smarter 'bury' combinator.
+bury2
+  :: Monad m
+  => (y -> z -> C r0 s0 r s m a)
+  -> C r0 s0 r s m (y -> z -> C r0 s0 r' s' m a)
+bury2 c = C $ \r2r0 gs0s ss0s -> return $ \y z -> C $ \_ _ _ ->
+    runC (c y z) r2r0 gs0s ss0s
 
--- | Nest a 'Controller' compatible with the same top-level request
--- and operation types.
+-- | Nest a 'Controller' compatible with the same top-level request and
+-- model state types.
 nestController
   :: forall m s0 r0 s r s' r'
    . Monad m
-  => (s -> Maybe s') -- ^ A “getter”. TODO: Ideally I want to take a Traversal
-                     --   here, and for each target, run the nested controller.
-                     --   However, to do that, it seems I need to be able to
-                     --   convert a Traversal targeting N elements to N
-                     --   Traversals targeting 1 element. See some hints at
-                     --   https://github.com/ekmett/lens/issues/252
-  -> (s' -> s -> s)  -- ^ A “setter”. Same comment as above. It is OK for this
-                     --   setter to leave the given @s@ untouched if the @s'@
-                     --   has no place in it.
+  => (s -> Maybe s', s' -> s -> s)
+  -- ^ A “getter” and a “setter”. It is OK for this setter to leave the given
+  -- @s@ untouched if the @s'@  has no place in it. TODO: Ideally I want to take
+  -- a Traversal here, and for each target, run the nested controller. However,
+  -- to do that, it seems I need to be able to convert a Traversal targeting N
+  -- elements to N Traversals targeting 1 element.
+  -- See some hints at https://github.com/ekmett/lens/issues/252
   -> (r' -> r)
   -> r'
   -> Controller r0 s0 r' s' m
   -> C r0 s0 r s m ()
-nestController gss' sss' r'2r r' cer = C $ \r2r0 gs0s ss0s -> do
+nestController (gss', sss') r'2r r' cer = C $ \r2r0 gs0s ss0s -> do
     runC (unController cer r')
          (r2r0 . r'2r)
          (gss' <=< gs0s)
@@ -206,15 +206,26 @@ nestController gss' sss' r'2r r' cer = C $ \r2r0 gs0s ss0s -> do
              Nothing -> s0
              Just s  -> ss0s (sss' s' s) s0)
 
--- -- | Nest a top-level 'Controller'.
--- nestController0
---   :: (Monad m, Functor m)
---   => Lens' s' s
---   -> r
---   -> Controller r r s m
---   -> C r0 r s' m ()
--- nestController0 l r cer = C $ \r2r0 ->
---    hoist (zoom l) (runC (unController cer r) id //> Pipes.yield . fmap r2r0)
+-- | Nest a top-level 'Controller'.
+nestController0
+  :: (Monad m, Functor m)
+  => (s -> Maybe s', s' -> s -> s)
+  -> (r' -> r)
+  -> r'
+  -> Controller r' s' r' s' m
+  -> C r0 s0 r s m ()
+nestController0 (gss', sss') r'2r r' cer =
+    C $ \r2r0 gs0s ss0s -> MaybeT $ State.StateT $ \s0 -> do
+       let ms' = gss' =<< gs0s s0
+           ss0s' = \s' -> case gs0s s0 of
+              Nothing -> s0
+              Just s  -> ss0s (sss' s' s) s0
+       case ms' of
+          Nothing -> return (Nothing, s0)
+          Just s' -> do
+             s'_ <- runController cer r' s' //> Pipes.yield . fmap (r2r0 . r'2r)
+             return (Just (), ss0s' s'_)
+{-# INLINABLE nestController0 #-}
 
 --------------------------------------------------------------------------------
 
@@ -368,11 +379,11 @@ run bracket dbg0 s0 cer vw = do
               r <- liftIO $ STM.atomically $ do
                  r <- STM.readTQueue tqR
                  r <$ STM.writeTChan tcbDebug (DebugReqStart r s)
-              !s' <- flip State.execStateT s $ Pipes.runEffect $ do
-                 Pipes.for (runController cer r) $ \mr' -> do
+              !s' <- Pipes.runEffect $ do
+                 Pipes.for (runController cer r s) $ \mr' -> do
                     case mr' of
                        Just r' -> liftIO $ reqIO r'
-                       Nothing -> liftIO stopIO >> lift (lift (loop s))
+                       Nothing -> liftIO stopIO >> lift (loop s)
               liftIO $ STM.atomically $ do
                  void $ STM.tryTakeTMVar tmvSLast
                  if s == s'
