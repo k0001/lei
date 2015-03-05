@@ -19,11 +19,11 @@
 -- * Controllers take a request, interact with the real world, and then change
 --   the model state.
 --
--- * Controllers handling the same request type can be composed using 'mappend'.
+-- * Controllers handling the same or different request and or model state types
+--   can be composed using 'mappend'.
 --
--- * Controllers handling different request types or working with different
---   model states can be nested and can communicate with each other
---   bidirectionally.
+-- * Different controllers can communicate with each other bidirectionally and
+--   share the same monad stack.
 --
 -- * Views render the model state.
 --
@@ -70,6 +70,7 @@ module Lei
   -- * Controller
   , Controller
   , mkController
+  , controlling
 
   , C
   , req
@@ -135,6 +136,18 @@ instance Monad m => Monoid (Controller r0 s0 r s m) where
 
 mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m -- ^
 mkController = Controller
+{-# INLINABLE mkController #-}
+
+controlling
+  :: Monad m
+  => Prism' r r'
+  -> (s -> Maybe s', s' -> s -> s)
+  -> Controller r0 s0 r' s' m
+  -> Controller r0 s0 r  s  m -- ^
+controlling prr' xss' cer = mkController $ \r ->
+    traverse_ (nestController cer xss' (review prr')) (preview prr' r)
+{-# INLINABLE controlling #-}
+
 
 runController
   :: Monad m
@@ -247,7 +260,8 @@ bury2 c = C $ \r2r0 gs0s ss0s -> return $ \y z -> C $ \_ _ _ ->
 -- Note: using 'nestController0' not only you can obtain a 'C' that can be
 -- used inline within other 'Controller', but also you can create a
 -- 'Controller' itself that you can then combine with other controller
--- using 'mappend':
+-- using 'mappend'. The 'controlling' function provides a nicer interface to
+-- this way if of composing 'Controller's.
 --
 -- @
 -- mappend (mkController (nestController a b c)) myOtherController
