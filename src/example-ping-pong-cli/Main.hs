@@ -53,7 +53,7 @@ def n = do
 -- THE VIEW
 
 view :: MonadIO m => Env -> Lei.View () Req Model m (IO ())
-view e = Lei.mkViewSimple $ \s req -> do
+view e = Lei.mkViewSimple $ \req s -> do
        printReport s
        envPrompter e $ do
           a <- readPingPong

@@ -49,9 +49,11 @@
 -- them follow the same naming convention. Here is a reference to keep handy
 -- while you familiarize yourself with Lei:
 --
+-- * @s0@: the top-level model state type.
+--
 -- * @s @: the model state type at the current 'Controller' or 'View' layer.
 --
--- * @s0@: the top-level model state type.
+-- * @s'@: the model state type one layer below the current 'Controller' layer.
 --
 -- * @r @: the request type at the current 'Controller' or 'View' layer,
 --   to be handled by a compatible 'Controller'.
@@ -60,6 +62,8 @@
 --   'Controller'.
 --
 -- * @v @: the 'View' state type at the current 'View' layer.
+--
+-- * @s'@: the model state type one layer below the current 'Controller' layer.
 --
 -- * @m @: the monad where the 'Controller's and the 'ViewInit's run.
 module Lei
@@ -355,7 +359,7 @@ newtype ViewRender v r s x = ViewRender { unViewRender :: s -> VR v r x }
 mkViewRenderCacheLast
   :: forall v r s x
    . (Eq v, Eq s)
-  => (s -> (r -> IO ()) -> VR v r x)
+  => ((r -> IO ()) -> s -> VR v r x)
   -> IO (ViewRender v r s x)
 mkViewRenderCacheLast kvr = do
   iorCache <- IORef.newIORef ((\_ _ -> Nothing) :: s -> v -> Maybe (x, v))
@@ -364,7 +368,7 @@ mkViewRenderCacheLast kvr = do
      case cacheLookup s0 v0 of
         Just xv -> return xv
         Nothing -> do
-           !xv@(!_,!_) <- unVR (kvr s0 reqIO) stopIO reqIO v0
+           !xv@(!_,!_) <- unVR (kvr reqIO s0) stopIO reqIO v0
            IORef.atomicWriteIORef iorCache $ \s v ->
               if s == s0 && v == v0 then Just xv else Nothing
            return xv
@@ -380,7 +384,7 @@ runView (View vi0) = do
 
 mkView
   :: (MonadIO m, Eq v, Eq s)
-  => ViewInit v m (v, v -> IO (), s -> (r -> IO ()) -> VR v r x)
+  => ViewInit v m (v, v -> IO (), (r -> IO ()) -> s -> VR v r x)
   -- ^ @v@: view state.
   --
   --   @v -> 'IO' ()@: release resources acquired by 'ViewInit'.
@@ -400,7 +404,7 @@ mkView vi = View $ do
 -- finalization to worry about.
 mkViewSimple
   :: (Eq s, MonadIO m)
-  => (s -> (r -> IO ()) -> x) -- ^ @s@: state to render.
+  => ((r -> IO ()) -> s -> x) -- ^ @s@: state to render.
                               --
                               --   @r -> 'IO' ()@: issue a request.
                               --
