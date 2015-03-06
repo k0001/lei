@@ -74,7 +74,8 @@ module Lei
   -- * Controller
   , Controller
   , mkController
-  , controlling
+  , nestedController
+  , nestedController0
 
   , C
   , req
@@ -116,7 +117,7 @@ import           Control.Monad.Trans.Class (MonadTrans(lift))
 import           Control.Monad.Trans.Maybe (MaybeT(MaybeT), runMaybeT)
 import qualified Control.Monad.State as State
 import           Data.Data (Data)
-import           Data.Foldable (traverse_)
+import           Data.Foldable (mapM_)
 import           Data.Function (fix)
 import qualified Data.IORef as IORef
 import           Data.Monoid (Monoid(..))
@@ -124,12 +125,12 @@ import           Data.Typeable (Typeable)
 import           GHC.Generics (Generic)
 import qualified Pipes
 import           Pipes.Core ((//>))
-import           Prelude hiding (sequence_)
+import           Prelude hiding (mapM_)
 
 
 --------------------------------------------------------------------------------
 
--- | A 'Controller', constructed with 'controller', is where you deal with a
+-- | A 'Controller', constructed with 'mkController', is where you deal with a
 -- concrete request of type @r@ using a given @'C' r0 o0 r o m a@.
 newtype Controller r0 s0 r s m = Controller { unController :: r -> C r0 s0 r s m () }
 
@@ -142,24 +143,33 @@ mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m -- ^
 mkController = Controller
 {-# INLINABLE mkController #-}
 
-controlling
+nestedController
   :: Monad m
-  => Prism' r r'
+  => Controller r0 s0 r' s' m
+  -> Prism' r r'
   -> (s -> Maybe s', s' -> s -> s)
-  -> Controller r0 s0 r' s' m
   -> Controller r0 s0 r  s  m -- ^
-controlling prr' xss' cer = mkController $ \r ->
-    traverse_ (nestController cer xss' (review prr')) (preview prr' r)
-{-# INLINABLE controlling #-}
+nestedController cer prr' xss' = Controller $ \r ->
+    mapM_ (nestController cer xss' (review prr')) (preview prr' r)
+{-# INLINABLE nestedController #-}
 
+nestedController0
+  :: Monad m
+  => Controller r' s' r' s' m
+  -> Prism' r r'
+  -> (s -> Maybe s', s' -> s -> s)
+  -> Controller r0 s0 r  s  m -- ^
+nestedController0 cer prr' xss' = Controller $ \r ->
+    mapM_ (nestController0 cer xss' (review prr')) (preview prr' r)
+{-# INLINABLE nestedController0 #-}
 
-runController
+runController0
   :: Monad m
   => Controller r s r s m
   -> r
   -> s
   -> Pipes.Producer (Maybe r) m s
-runController cer r =
+runController0 cer r =
    State.execStateT $ runMaybeT $ runC (unController cer r) id (Just . id) const
 
 
@@ -264,8 +274,8 @@ bury2 c = C $ \r2r0 gs0s ss0s -> return $ \y z -> C $ \_ _ _ ->
 -- Note: using 'nestController0' not only you can obtain a 'C' that can be
 -- used inline within other 'Controller', but also you can create a
 -- 'Controller' itself that you can then combine with other controller
--- using 'mappend'. The 'controlling' function provides a nicer interface to
--- this way if of composing 'Controller's.
+-- using 'mappend'. The 'nestedController' function provides a nicer interface
+-- to this way if of composing 'Controller's.
 --
 -- @
 -- mappend (mkController (nestController a b c)) myOtherController
@@ -293,7 +303,7 @@ nestController cer (gss', sss') r'2r r' = C $ \r2r0 gs0s ss0s -> do
 
 -- | Like 'nestController', but for nesting a top-level 'Controller'.
 nestController0
-  :: (Monad m, Functor m)
+  :: (Monad m)
   => Controller r' s' r' s' m
   -> (s -> Maybe s', s' -> s -> s)
   -> (r' -> r)
@@ -308,7 +318,7 @@ nestController0 cer (gss', sss') r'2r r' =
        case ms' of
           Nothing -> return (Nothing, s0)
           Just s' -> do
-             s'_ <- runController cer r' s' //> Pipes.yield . fmap (r2r0 . r'2r)
+             s'_ <- runController0 cer r' s' //> Pipes.yield . fmap (r2r0 . r'2r)
              return (Just (), ss0s' s'_)
 {-# INLINABLE nestController0 #-}
 
@@ -493,7 +503,7 @@ run bracket dbg0 s0 cer vw = do
                  r <- STM.readTQueue tqR
                  r <$ STM.writeTChan tcbDebug (DebugReqStart r s)
               !s' <- Pipes.runEffect $ do
-                 Pipes.for (runController cer r s) $ \mr' -> do
+                 Pipes.for (runController0 cer r s) $ \mr' -> do
                     case mr' of
                        Just r' -> liftIO $ reqIO r'
                        Nothing -> liftIO stopIO >> lift (loop s)
@@ -569,7 +579,7 @@ runViewStop (ViewStop iomv) v = liftIO $ do
     mv <- iomv
     Ex.bracket (MVar.takeMVar mv)
                (\_ -> MVar.putMVar mv Nothing)
-               (traverse_ ($ v))
+               (mapM_ ($ v))
 
 -- | @'mappend' a b@ runs @a@ first and then @b@, even in case of exceptions.
 instance Monoid (ViewStop v) where
