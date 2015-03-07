@@ -80,8 +80,7 @@ module Lei
   , C
   , req
   , stop
-  , bury
-  , bury2
+  , top
   , nestController
   , nestController0
 
@@ -195,7 +194,8 @@ runController0 cer r =
 --
 -- 'Controller's can be nested inside a 'C' using the 'nestController' and
 -- 'nestController0' combinators, and actions to be executed at the current
--- controller layer can be used by nested 'Controller's after being 'bury'ed.
+-- controller layer can be used by nested 'Controller's after being made
+-- compatible using 'top'.
 newtype C r0 s0 r s m a = C
   (    (r -> r0)
     -> (s0 -> Maybe s) -- A getter.
@@ -249,24 +249,15 @@ stop :: Monad m => C r0 s0 r s m ()
 stop = C $ \_ _ _ -> lift $ lift $ Pipes.yield Nothing
 {-# INLINABLE stop #-}
 
--- | Bury a 'C' so that it can be used at a lower 'C' layer
--- sharing the same top-level request and operation types.
-bury
+-- | Promote a 'C' so that it operates directly on the top-level request and
+-- model state type, effectily making this 'C' compatible with any other sharing
+-- the same top-level request and model state types.
+top
   :: Monad m
   => C r0 s0 r s m a
   -> C r0 s0 r s m (C r0 s0 r' s' m a) -- ^
-bury c = C $ \r2r0 gs0s ss0s -> return $ C $ \_ _ _ -> runC c r2r0 gs0s ss0s
-{-# INLINABLE bury #-}
-
--- | Like 'bury' but for a function taking 2 arguments.
---
--- TODO: Not offer this, we should provide just a smarter 'bury' combinator.
-bury2
-  :: Monad m
-  => (y -> z -> C r0 s0 r s m a)
-  -> C r0 s0 r s m (y -> z -> C r0 s0 r' s' m a) -- ^
-bury2 c = C $ \r2r0 gs0s ss0s -> return $ \y z -> C $ \_ _ _ ->
-    runC (c y z) r2r0 gs0s ss0s
+top c = C $ \r2r0 gs0s ss0s -> return $ C $ \_ _ _ -> runC c r2r0 gs0s ss0s
+{-# INLINABLE top #-}
 
 -- | Nest a 'Controller' compatible with the same top-level request and
 -- model state types.
