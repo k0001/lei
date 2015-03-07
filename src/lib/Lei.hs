@@ -74,8 +74,8 @@ module Lei
   -- * Controller
   , Controller
   , mkController
-  , nestedController
-  , nestedController0
+  , controlling
+  , controlling0
 
   , C
   , req
@@ -142,25 +142,35 @@ mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m -- ^
 mkController = Controller
 {-# INLINABLE mkController #-}
 
-nestedController
+controlling
   :: Monad m
-  => Controller r0 s0 r' s' m
-  -> Prism' r r'
+  => Prism' r r'
+  -- ^ Matches the @r'@s that will be handled by the nested controller.
   -> (s -> Maybe s', s' -> s -> s)
-  -> Controller r0 s0 r  s  m -- ^
-nestedController cer prr' xss' = Controller $ \r ->
-    mapM_ (nestController cer xss' (review prr')) (preview prr' r)
-{-# INLINABLE nestedController #-}
+  -- ^ Think of this as the getter and the setter for a 'Traversal''
+  -- targeting 0 or 1 elements, not more.
+  -> ((C r0 s0 r s m a -> C r0 s0 r' s' m a) -> Controller r0 s0 r' s' m)
+  -- ^ Returns the 'Controller' that will  hand requests matched by the given
+  --   'Prism''. The given /natural transformation/ “downgrades” 'C' actions
+  --   happening at the current 'Controller' layer so that they can be used
+  --   on the nested 'Controller'.
+  -> Controller r0 s0 r s m -- ^
+controlling prr' xss' kcer = Controller $ \r -> C $ \r2r0 gs0s ss0s -> do
+    let cer = kcer $ \c' -> C $ \_ _ _ -> runC c' r2r0 gs0s ss0s
+        C f = mapM_ (nestController cer xss' (review prr')) (preview prr' r)
+    f r2r0 gs0s ss0s
+{-# INLINABLE controlling #-}
 
-nestedController0
+-- | Like 'controlling', but for nesting a top-level 'Controller'.
+controlling0
   :: Monad m
-  => Controller r' s' r' s' m
-  -> Prism' r r'
+  => Prism' r r'
   -> (s -> Maybe s', s' -> s -> s)
+  -> Controller r' s' r' s' m
   -> Controller r0 s0 r  s  m -- ^
-nestedController0 cer prr' xss' = Controller $ \r ->
+controlling0 prr' xss' cer = Controller $ \r ->
     mapM_ (nestController0 cer xss' (review prr')) (preview prr' r)
-{-# INLINABLE nestedController0 #-}
+{-# INLINABLE controlling0 #-}
 
 runController0
   :: Monad m
@@ -265,7 +275,7 @@ top c = C $ \r2r0 gs0s ss0s -> return $ C $ \_ _ _ -> runC c r2r0 gs0s ss0s
 -- Note: using 'nestController0' not only you can obtain a 'C' that can be
 -- used inline within other 'Controller', but also you can create a
 -- 'Controller' itself that you can then combine with other controller
--- using 'mappend'. The 'nestedController' function provides a nicer interface
+-- using 'mappend'. The 'controlling' function provides a nicer interface
 -- to this way if of composing 'Controller's.
 --
 -- @
@@ -284,7 +294,7 @@ nestController
   -> (r' -> r)
   -> r'
   -> C r0 s0 r s m ()
-nestController cer (gss', sss') r'2r r' = C $ \r2r0 gs0s ss0s -> do
+nestController cer (gss', sss') r'2r = \r' -> C $ \r2r0 gs0s ss0s -> do
     runC (unController cer r')
          (r2r0 . r'2r)
          (gss' <=< gs0s)
@@ -300,7 +310,7 @@ nestController0
   -> (r' -> r)
   -> r'
   -> C r0 s0 r s m () -- ^
-nestController0 cer (gss', sss') r'2r r' =
+nestController0 cer (gss', sss') r'2r = \r' ->
     C $ \r2r0 gs0s ss0s -> MaybeT $ State.StateT $ \s0 -> do
        let ms' = gss' =<< gs0s s0
            ss0s' = \s' -> case gs0s s0 of
