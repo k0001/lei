@@ -80,7 +80,6 @@ module Lei
   , C
   , req
   , stop
-  , top
   , nestController
   , nestController0
 
@@ -130,7 +129,21 @@ import           Prelude hiding (mapM_)
 --------------------------------------------------------------------------------
 
 -- | A 'Controller', constructed with 'mkController', is where you deal with a
--- concrete request of type @r@ using a given @'C' r0 o0 r o m a@.
+-- concrete request of type @r@ and affect the “local” model state @s@ while
+-- having access to a monad stack @m@.
+--
+-- The @r0@ and @s0@ are the top-level request and model state types, and they
+-- indicate that 'Controller' can be nested within another controller sharing
+-- the same @r0@ and @s0@, of which @r@ and @s@ are smaller pieces.
+--
+-- A 'Controller r0 s0 r s m' runs whenever there is an @r@ in @r0@, and for as
+-- long as @s@ can be found within @s0@. This last bit is quite important, it
+-- means that, at any time, a larger 'Controller' nesting the former can
+-- remove @s@ from @s0@, which will cause the nested 'Controller' to
+-- /gracefully/ stop excecuting right away.
+--
+-- 'controlling' and 'controlling0' allow you to nest 'Controllers' so that they
+-- can be composed afterwards with 'mappend'.
 newtype Controller r0 s0 r s m = Controller { unController :: r -> C r0 s0 r s m () }
 
 -- | @'mappend' a b@: First @a@ handles @r@, and then @b@ handles the same @r@.
@@ -138,10 +151,17 @@ instance Monad m => Monoid (Controller r0 s0 r s m) where
   mempty = Controller $ \_ -> return ()
   mappend a b = Controller $ \r -> unController a r >> unController b r
 
+-- | See the documentation for 'Controller'.
 mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m -- ^
 mkController = Controller
 {-# INLINABLE mkController #-}
 
+-- Nest a @'Controller' r0 s0 s' r' m@ inside a larger
+-- @'Controller' r0 s0 s r m@ ensuring that it executes when as for as
+-- long as it is explained in the documentation for 'Controller'.
+--
+-- By /larger/ we mean that @r'@ is potentially contained in @r@, and that
+-- @s'@ is potentially contained in @s@.
 controlling
   :: Monad m
   => Prism' r r'
@@ -155,10 +175,8 @@ controlling
   --   happening at the current 'Controller' layer so that they can be used
   --   on the nested 'Controller'.
   -> Controller r0 s0 r s m -- ^
-controlling prr' xss' kcer = Controller $ \r -> C $ \r2r0 gs0s ss0s -> do
-    let cer = kcer $ \c' -> C $ \_ _ _ -> runC c' r2r0 gs0s ss0s
-        C f = mapM_ (nestController cer xss' (review prr')) (preview prr' r)
-    f r2r0 gs0s ss0s
+controlling prr' xss' kcer = Controller $ \r ->
+    mapM_ (nestController kcer xss' (review prr')) (preview prr' r)
 {-# INLINABLE controlling #-}
 
 -- | Like 'controlling', but for nesting a top-level 'Controller'.
@@ -181,31 +199,35 @@ runController0
 runController0 cer r =
    State.execStateT $ runMaybeT $ runC (unController cer r) id (Just . id) const
 
-
 --------------------------------------------------------------------------------
 
 -- | A @'C' r0 s0 r s m a@ is where you can issue requests of type @r@ and
--- modify a model state of type @s@, within a larger context of top-level
--- requests of type @r0@ and a top-level model state of type @s0@'. A
--- 'C' where the top-level request and model state types match the request
--- and operation types of the current layer is said to be a top-level 'C'.
+-- modify a model state of type @s@ while having access to a monad @m@, as
+-- described in the documentation for 'Controller'.
+--
 -- A 'C' needs be converted into a 'Controller' using 'controller' before
 -- it can be used as (or as part of) a top-level 'Controller'.
 --
--- * A request is delivered asyncrhonously for another 'Controller' to
---   eventually c it. You use 'req' to issue a request.
+-- It is important to know that a 'C' (and thus, a 'Controller'), runs until it
+-- finishes on its own or until the model state can't be found on the top-level
+-- state anymore. This allows top-level 'Controller' to alter their state
+-- without causing child controllers to fail. This is handled automatically in
+-- the background for you.
 --
--- * Changes to the model state happen atomically when the 'Controller' runs.
+-- Things that you can do in a @'C' r0 s0 r s m a@:
 --
--- * A 'C' (and thus, a 'Controller'), runs until it finishes on its own or
---   until the model state can't be found on the top-level state anymore.
---   This allows top-level 'Controller' to alter their state without causing
---   child controllers to fail.
+-- * Everything @m@ allows.
 --
--- 'Controller's can be nested inside a 'C' using the 'nestController' and
--- 'nestController0' combinators, and actions to be executed at the current
--- controller layer can be used by nested 'Controller's after being made
--- compatible using 'top'.
+-- * Request of type @r@ can be delivered asyncrhonously for another
+--   'Controller' (possibly this very same one) to eventually handle it.
+--   You use 'req' to issue a request.
+--
+-- * Change the model state. Changes happen atomically when the 'Controller'
+--   runs.
+--
+-- * Nest 'Controllers'. In a similar spirit to 'controlling' and
+--   'controlling0', the tools 'nestController' and 'nestController0' allow
+--   you to nest a 'Controller' inside a 'C' explicitely.
 newtype C r0 s0 r s m a = C
   (    (r -> r0)
     -> (s0 -> Maybe s) -- A getter.
@@ -241,6 +263,10 @@ instance Monad m => Monad (C r0 s0 r s m) where
 instance MonadIO m => MonadIO (C r0 s0 r s m) where
   liftIO = lift . liftIO
 
+-- | Changes to @s@ won't be fully commited to the state until the
+-- 'Controller' that embeds this 'C' finishes executing. Nevertheless,
+-- within @C@, this 'State.MonadState' will behave as expected and will
+-- always reflect the most recently desired state.
 instance Monad m => State.MonadState s (C r0 s0 r s m) where
   state k = C $ \_ gs0s ss0s -> MaybeT $ State.state $ \s0 ->
     case gs0s s0 of
@@ -250,40 +276,24 @@ instance Monad m => State.MonadState s (C r0 s0 r s m) where
 instance MonadTrans (C r0 s0 r s) where
   lift ma = C $ \_ _ _ -> lift (lift (lift ma))
 
--- | Issue a local request for another 'Controller' to eventually handle it.
+-- | Issue a local request for a 'Controller' to eventually handle it.
 req :: Monad m => r -> C r0 s0 r s m ()
 req r = C $ \r2r0 _ _ -> lift $ lift $ Pipes.yield $ Just (r2r0 r)
 {-# INLINABLE req #-}
 
+-- | Gracefully stop execution of the entire Lei application.
 stop :: Monad m => C r0 s0 r s m ()
 stop = C $ \_ _ _ -> lift $ lift $ Pipes.yield Nothing
 {-# INLINABLE stop #-}
 
--- | Promote a 'C' so that it operates directly on the top-level request and
--- model state type, effectily making this 'C' compatible with any other sharing
--- the same top-level request and model state types.
-top
-  :: Monad m
-  => C r0 s0 r s m a
-  -> C r0 s0 r s m (C r0 s0 r' s' m a) -- ^
-top c = C $ \r2r0 gs0s ss0s -> return $ C $ \_ _ _ -> runC c r2r0 gs0s ss0s
-{-# INLINABLE top #-}
-
--- | Nest a 'Controller' compatible with the same top-level request and
--- model state types.
---
--- Note: using 'nestController0' not only you can obtain a 'C' that can be
--- used inline within other 'Controller', but also you can create a
--- 'Controller' itself that you can then combine with other controller
--- using 'mappend'. The 'controlling' function provides a nicer interface
--- to this way if of composing 'Controller's.
---
--- @
--- mappend (mkController (nestController a b c)) myOtherController
--- @
+-- | Nest a 'Controller' inside a 'C', in a similar spirit to 'controlling'.
 nestController
   :: Monad m
-  => Controller r0 s0 r' s' m
+  => ((C r0 s0 r s m a -> C r0 s0 r' s' m a) -> Controller r0 s0 r' s' m)
+  -- ^ Returns the 'Controller' that will  hand requests matched by the given
+  --   'Prism''. The given /natural transformation/ “downgrades” 'C' actions
+  --   happening at the current 'Controller' layer so that they can be used
+  --   on the nested 'Controller'.
   -> (s -> Maybe s', s' -> s -> s)
   -- ^ A getter and a setter. It is OK for this setter to leave the given
   -- @s@ untouched if the @s'@  has no place in it. TODO: Ideally I want to take
@@ -294,7 +304,8 @@ nestController
   -> (r' -> r)
   -> r'
   -> C r0 s0 r s m ()
-nestController cer (gss', sss') r'2r = \r' -> C $ \r2r0 gs0s ss0s -> do
+nestController kcer (gss', sss') r'2r = \r' -> C $ \r2r0 gs0s ss0s -> do
+    let cer = kcer $ \c' -> C $ \_ _ _ -> runC c' r2r0 gs0s ss0s
     runC (unController cer r')
          (r2r0 . r'2r)
          (gss' <=< gs0s)
@@ -324,7 +335,9 @@ nestController0 cer (gss', sss') r'2r = \r' ->
 {-# INLINABLE nestController0 #-}
 
 --------------------------------------------------------------------------------
-
+-- | While having access to a view state @v@, render an @x@ that could
+-- potentially issue requests of type @r@ to be eventually handled by a
+-- 'Controller'.
 newtype VR v r x = VR { unVR :: IO () -> (r -> IO ()) -> v -> IO (x, v) }
   deriving (Functor)
 
@@ -360,11 +373,18 @@ getStop :: VR v r (IO ())
 getStop = VR $ \a _ v -> return (a, v)
 
 -- | Render a view that had been previously nested using 'nestView'.
+--
+-- @x@ is guaranteed to be sucessfully looked up from a cache if @s@ and @v@
+-- haven't changed since the last time the given @'ViewRender' v r s x@ was
+-- 'render'ed.
 render :: ViewRender v r s x -> s -> VR v r x
 render vr s = VR $ \stopIO reqIO v -> unVR (unViewRender vr s) stopIO reqIO v
 
 --------------------------------------------------------------------------------
 
+-- | Renders a model of type @s@ as an @x@ that could potentially issue
+-- requests of type @r@. While rendering, access to the view state @v@ is
+-- available for read and write purposes.
 newtype ViewRender v r s x = ViewRender { unViewRender :: s -> VR v r x }
 
 mkViewRenderCacheLast
@@ -385,7 +405,7 @@ mkViewRenderCacheLast kvr = do
            return xv
 
 --------------------------------------------------------------------------------
-
+-- See the documentation for 'mkView'.
 data View v r s m x = View !(ViewInit v m (v, ViewStop v, ViewRender v r s x))
 
 runView :: Monad m => View v r s m x -> m (v, ViewStop v, ViewRender v r s x)
@@ -393,6 +413,24 @@ runView (View vi0) = do
    ((v0, vs0, vrr0), vs) <- runViewInit vi0
    return (v0, mappend vs vs0, vrr0)
 
+-- | Creates a 'View' describing the lifetime of a 'ViewRender', consisting of
+-- an initialization routine ('ViewInit') to be executed only once at the
+-- beginning of the execution of the Lei application, which will return:
+--
+-- 1. An initial “view state” of type @v@. This will be available for
+-- modification each time 'VR' runs.
+--
+-- 2. A deinitialization routine, which will called in case of execptions or
+-- graceful shutdown of the Lei application including this 'View'. The most
+-- recent value of the view state @v@ will be passed in.
+--
+-- 3. An action that given an @s@ will render an @x@ potentially issuing
+-- requests of type @r@ and modifying the view state @v@. This action will
+-- be executed only if at least one of @s@ or @v@ have changed since the last
+-- time this action was executed.
+--
+-- The resulting 'View' can either be as a top-level view for a Lei application
+-- using 'run', or it can be nested in larger 'View's using 'nestView'.
 mkView
   :: (MonadIO m, Eq v, Eq s)
   => ViewInit v m (v, v -> IO (), (r -> IO ()) -> s -> VR v r x)
@@ -425,12 +463,18 @@ mkViewSimple kvr = mkView $ return ((), return, ((return.).) kvr)
 
 --------------------------------------------------------------------------------
 
+-- | Action to be executed just once during the initialization of a 'View',
+-- preparing an initial view state of type @v@.
 newtype ViewInit v m a = ViewInit (State.StateT (ViewStop v) m a)
   deriving (Functor, Applicative, Monad, MonadIO, MonadTrans)
 
 runViewInit :: ViewInit v m a -> m (a, ViewStop v)
 runViewInit (ViewInit s) = State.runStateT s mempty
 
+-- | Nest a smaller 'View' within a larger 'View'.
+--
+-- By “smaller” we mean that @v'@ is smaller than @v@, and that @r'@ is smaller
+-- than @r@.
 nestView
  :: Monad m
  => Lens' v' v
@@ -461,7 +505,6 @@ runSimple
   -- ^ /View/ issuing controller requests and rendering the model.
   -> IO ()
 runSimple = run Ex.bracket (\_ -> return ())
-
 
 -- | Run a Lei application.
 run
