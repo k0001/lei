@@ -115,6 +115,7 @@ import qualified Control.Concurrent.STM as STM
 import           Control.Lens
 import           Control.Monad (void, unless, ap, (<=<))
 import           Control.Monad.IO.Class (MonadIO(liftIO))
+import           Control.Monad.Morph (MFunctor(hoist), MMonad(embed))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
 import           Control.Monad.Trans.Maybe (MaybeT(MaybeT), runMaybeT)
 import qualified Control.Monad.State as State
@@ -126,9 +127,8 @@ import           Data.Monoid (Monoid(..))
 import           Data.Typeable (Typeable)
 import           GHC.Generics (Generic)
 import qualified Pipes
-import           Pipes.Core ((//>))
+import qualified Pipes.Internal as Pipes
 import           Prelude hiding (mapM_)
-
 
 --------------------------------------------------------------------------------
 
@@ -233,12 +233,12 @@ runController0 cer r =
 --   'controlling0', the tools 'nestController' and 'nestController0' allow
 --   you to nest a 'Controller' inside a 'C' explicitely.
 newtype C r0 s0 r s m a = C
-  (    (r -> r0)
-    -> (s0 -> Maybe s) -- A getter.
-    -> (s -> s0 -> s0) -- A setter. It is OK to leave @s0@ untouched if @s@
-                       -- has no place in it.
-    -> MaybeT (State.StateT s0 (Pipes.Producer (Maybe r0) m)) a
-  ) deriving (Functor)
+  { unC :: (r -> r0)
+        -> (s0 -> Maybe s) -- A getter.
+        -> (s -> s0 -> s0) -- A setter. It is OK to leave @s0@ untouched if @s@
+                           -- has no place in it.
+        -> MaybeT (State.StateT s0 (Pipes.Producer (Maybe r0) m)) a
+  } deriving (Functor)
 
 runC
   :: Monad m
@@ -247,11 +247,11 @@ runC
   -> (s0 -> Maybe s)
   -> (s -> s0 -> s0)
   -> MaybeT (State.StateT s0 (Pipes.Producer (Maybe r0) m)) a
-runC (C f) r2r0 gs0s ss0s = do
+runC c r2r0 gs0s ss0s = do
   s0 <- State.get
   case gs0s s0 of
      Nothing -> MaybeT (return Nothing)
-     Just _  -> f r2r0 gs0s ss0s
+     Just _  -> unC c r2r0 gs0s ss0s
 {-# INLINE runC #-}
 
 instance Monad m => Applicative (C r0 s0 r s m) where
@@ -272,13 +272,20 @@ instance MonadIO m => MonadIO (C r0 s0 r s m) where
 -- within @C@, this 'State.MonadState' will behave as expected and will
 -- always reflect the most recently desired state.
 instance Monad m => State.MonadState s (C r0 s0 r s m) where
-  state k = C $ \_ gs0s ss0s -> MaybeT $ State.state $ \s0 ->
+  state k = C (\_ gs0s ss0s -> MaybeT (State.state (\s0 ->
     case gs0s s0 of
        Nothing -> (Nothing, s0)
-       Just s  -> let !(a, !s') = k s in (Just a, ss0s s' s0)
+       Just s  -> let !(a, !s') = k s in (Just a, ss0s s' s0))))
 
 instance MonadTrans (C r0 s0 r s) where
-  lift ma = C $ \_ _ _ -> lift (lift (lift ma))
+  lift ma = C (\_ _ _ -> lift (lift (lift ma)))
+  {-# INLINABLE lift #-}
+
+instance MFunctor (C r0 s0 r s) where
+  hoist nat = \(C f) -> C (fmap (fmap (fmap (hoist (hoist (hoist nat))))) f)
+  {-# INLINABLE hoist #-}
+
+-- TODO:  instance MMonad (C r0 s0 r s) where
 
 -- | Issue a local request for a 'Controller' to eventually handle it.
 req :: Monad m => r -> C r0 s0 r s m ()
@@ -334,7 +341,8 @@ nestController0 cer (gss', sss') r'2r = \r' ->
        case ms' of
           Nothing -> return (Nothing, s0)
           Just s' -> do
-             s'_ <- runController0 cer r' s' //> Pipes.yield . fmap (r2r0 . r'2r)
+             s'_ <- Pipes.for (runController0 cer r' s')
+                              (Pipes.yield . fmap (r2r0 . r'2r))
              return (Just (), ss0s' s'_)
 {-# INLINABLE nestController0 #-}
 
