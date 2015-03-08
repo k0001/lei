@@ -66,6 +66,10 @@
 -- * @s'@: the model state type one layer below the current 'Controller' layer.
 --
 -- * @m @: the monad where the 'Controller's and the 'ViewInit's run.
+--
+-- Work with the type system, don't fight it. Lei is designed in such a way that
+-- you can rely to a great extent on the types and avoid a wide range of common
+-- mistakes, while still being able to /compose/ large applications.
 module Lei
   ( -- * Running a Lei application
     runSimple
@@ -156,7 +160,7 @@ mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m -- ^
 mkController = Controller
 {-# INLINABLE mkController #-}
 
--- Nest a @'Controller' r0 s0 s' r' m@ inside a larger
+-- | Nest a @'Controller' r0 s0 s' r' m@ inside a larger
 -- @'Controller' r0 s0 s r m@ ensuring that it executes when as for as
 -- long as it is explained in the documentation for 'Controller'.
 --
@@ -356,7 +360,7 @@ instance Applicative (VR v r) where
 -- (i.e., the @x@ in @VR v r x@), which means they may not be executed each
 -- time the rendering result is needed. If you intend some action to be executed
 -- at the time of rendering, then return that action as the result of the @VR@
--- action, that is, have @VR v r (IO ())@ or similar.
+-- action, that is, have @'VR' v r ('IO' ())@ or similar.
 instance MonadIO (VR v r) where
   liftIO m = VR $ \_ _ v -> fmap (flip (,) v) m
 
@@ -449,7 +453,7 @@ mkView vi = View $ do
   vr <- liftIO $ mkViewRenderCacheLast kvr
   return (v, mkViewStop iovs, vr)
 
--- Like 'mkView', except for when there is no view state, initialization nor
+-- | Like 'mkView', except for when there is no view state, initialization nor
 -- finalization to worry about.
 mkViewSimple
   :: (Eq s, MonadIO m)
@@ -475,20 +479,26 @@ runViewInit (ViewInit s) = State.runStateT s mempty
 --
 -- By “smaller” we mean that @v'@ is smaller than @v@, and that @r'@ is smaller
 -- than @r@.
+--
+-- The resulting @v'@ is to be included in @v@, otherwise rendering the view
+-- will fail. TODO: automate this step so that it can't be forgotten.
+--
+-- The resulting @'ViewRender' v r s x@ is to be rendered insider using
+-- 'render'.
 nestView
  :: Monad m
- => Lens' v' v
- -> (r -> r')
- -> View v r s m x
- -> ViewInit v' m (v, ViewRender v' r' s x) -- ^
-nestView l r2r' avw = ViewInit $ do
-   (av, avs, avrr) <- lift $ runView avw
-   State.modify $ mappend (contramapViewStop (view l) avs)
-   let vrr = ViewRender $ \s0 -> VR $ \stopIO reqIO v' -> do
-               let v1 = view l v'
-               (x, v2) <- unVR (unViewRender avrr s0) stopIO (reqIO . r2r') v1
-               return (x, set l v2 v')
-   return (av, vrr)
+ => Lens' v v'
+ -> (r' -> r)
+ -> View v' r' s m x
+ -> ViewInit v m (v', ViewRender v r s x) -- ^
+nestView lvv' r'2r av'w = ViewInit $ do
+   (av', av's, av'rr) <- lift $ runView av'w
+   State.modify $ mappend (contramapViewStop (view lvv') av's)
+   let vrr = ViewRender $ \s0 -> VR $ \stopIO reqIO v -> do
+          let v'1 = view lvv' v
+          (x, v'2) <- unVR (unViewRender av'rr s0) stopIO (reqIO . r'2r) v'1
+          return (x, set lvv' v'2 v)
+   return (av', vrr)
 
 --------------------------------------------------------------------------------
 
