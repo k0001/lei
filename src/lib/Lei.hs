@@ -115,7 +115,7 @@ import qualified Control.Concurrent.STM as STM
 import           Control.Lens
 import           Control.Monad (void, unless, ap, (<=<))
 import           Control.Monad.IO.Class (MonadIO(liftIO))
-import           Control.Monad.Morph (MFunctor(hoist), MMonad(embed))
+import           Control.Monad.Morph (MFunctor(hoist))
 import           Control.Monad.Trans.Class (MonadTrans(lift))
 import           Control.Monad.Trans.Maybe (MaybeT(MaybeT), runMaybeT)
 import qualified Control.Monad.State as State
@@ -127,7 +127,6 @@ import           Data.Monoid (Monoid(..))
 import           Data.Typeable (Typeable)
 import           GHC.Generics (Generic)
 import qualified Pipes
-import qualified Pipes.Internal as Pipes
 import           Prelude hiding (mapM_)
 
 --------------------------------------------------------------------------------
@@ -152,8 +151,8 @@ newtype Controller r0 s0 r s m = Controller { unController :: r -> C r0 s0 r s m
 
 -- | @'mappend' a b@: First @a@ handles @r@, and then @b@ handles the same @r@.
 instance Monad m => Monoid (Controller r0 s0 r s m) where
-  mempty = Controller $ \_ -> return ()
-  mappend a b = Controller $ \r -> unController a r >> unController b r
+  mempty = Controller (\_ -> return ())
+  mappend a b = Controller (\r -> unController a r >> unController b r)
 
 -- | See the documentation for 'Controller'.
 mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m -- ^
@@ -179,8 +178,8 @@ controlling
   --   happening at the current 'Controller' layer so that they can be used
   --   on the nested 'Controller'.
   -> Controller r0 s0 r s m -- ^
-controlling prr' xss' kcer = Controller $ \r ->
-    mapM_ (nestController kcer xss' (review prr')) (preview prr' r)
+controlling prr' xss' kcer = Controller (\r ->
+    mapM_ (nestController kcer xss' (review prr')) (preview prr' r))
 {-# INLINABLE controlling #-}
 
 -- | Like 'controlling', but for nesting a top-level 'Controller'.
@@ -190,8 +189,8 @@ controlling0
   -> (s -> Maybe s', s' -> s -> s)
   -> Controller r' s' r' s' m
   -> Controller r0 s0 r  s  m -- ^
-controlling0 prr' xss' cer = Controller $ \r ->
-    mapM_ (nestController0 cer xss' (review prr')) (preview prr' r)
+controlling0 prr' xss' cer = Controller (\r ->
+    mapM_ (nestController0 cer xss' (review prr')) (preview prr' r))
 {-# INLINABLE controlling0 #-}
 
 runController0
@@ -201,7 +200,7 @@ runController0
   -> s
   -> Pipes.Producer (Maybe r) m s
 runController0 cer r =
-   State.execStateT $ runMaybeT $ runC (unController cer r) id (Just . id) const
+   State.execStateT (runMaybeT (runC (unController cer r) id (Just . id) const))
 
 --------------------------------------------------------------------------------
 
@@ -259,10 +258,10 @@ instance Monad m => Applicative (C r0 s0 r s m) where
   (<*>) = ap
 
 instance Monad m => Monad (C r0 s0 r s m) where
-  return a = C $ \_ _ _ -> return a
-  ma >>= k = C $ \r2r0 gs0s ss0s -> do
+  return a = C (\_ _ _ -> return a)
+  ma >>= k = C (\r2r0 gs0s ss0s -> do
       a <- runC ma r2r0 gs0s ss0s
-      runC (k a) r2r0 gs0s ss0s
+      runC (k a) r2r0 gs0s ss0s)
 
 instance MonadIO m => MonadIO (C r0 s0 r s m) where
   liftIO = lift . liftIO
@@ -278,23 +277,21 @@ instance Monad m => State.MonadState s (C r0 s0 r s m) where
        Just s  -> let !(a, !s') = k s in (Just a, ss0s s' s0))))
 
 instance MonadTrans (C r0 s0 r s) where
-  lift ma = C (\_ _ _ -> lift (lift (lift ma)))
+  lift = \ma -> C (\_ _ _ -> lift (lift (lift ma)))
   {-# INLINABLE lift #-}
 
 instance MFunctor (C r0 s0 r s) where
   hoist nat = \(C f) -> C (fmap (fmap (fmap (hoist (hoist (hoist nat))))) f)
   {-# INLINABLE hoist #-}
 
--- TODO:  instance MMonad (C r0 s0 r s) where
-
 -- | Issue a local request for a 'Controller' to eventually handle it.
 req :: Monad m => r -> C r0 s0 r s m ()
-req r = C $ \r2r0 _ _ -> lift $ lift $ Pipes.yield $ Just (r2r0 r)
+req = \r -> C (\r2r0 _ _ -> lift (lift (Pipes.yield (Just (r2r0 r)))))
 {-# INLINABLE req #-}
 
 -- | Gracefully stop execution of the entire Lei application.
 stop :: Monad m => C r0 s0 r s m ()
-stop = C $ \_ _ _ -> lift $ lift $ Pipes.yield Nothing
+stop = C (\_ _ _ -> lift (lift (Pipes.yield Nothing)))
 {-# INLINABLE stop #-}
 
 -- | Nest a 'Controller' inside a 'C', in a similar spirit to 'controlling'.
@@ -315,14 +312,14 @@ nestController
   -> (r' -> r)
   -> r'
   -> C r0 s0 r s m ()
-nestController kcer (gss', sss') r'2r = \r' -> C $ \r2r0 gs0s ss0s -> do
-    let cer = kcer $ \c' -> C $ \_ _ _ -> runC c' r2r0 gs0s ss0s
+nestController kcer (gss', sss') r'2r = \r' -> C (\r2r0 gs0s ss0s -> do
+    let cer = kcer (\c' -> C (\_ _ _ -> runC c' r2r0 gs0s ss0s))
     runC (unController cer r')
          (r2r0 . r'2r)
          (gss' <=< gs0s)
          (\s' s0 -> case gs0s s0 of
              Nothing -> s0
-             Just s  -> ss0s (sss' s' s) s0)
+             Just s  -> ss0s (sss' s' s) s0))
 
 -- | Like 'nestController', but for nesting a top-level 'Controller'.
 nestController0
@@ -333,7 +330,7 @@ nestController0
   -> r'
   -> C r0 s0 r s m () -- ^
 nestController0 cer (gss', sss') r'2r = \r' ->
-    C $ \r2r0 gs0s ss0s -> MaybeT $ State.StateT $ \s0 -> do
+    C (\r2r0 gs0s ss0s -> MaybeT (State.StateT (\s0 -> do
        let ms' = gss' =<< gs0s s0
            ss0s' = \s' -> case gs0s s0 of
               Nothing -> s0
@@ -343,7 +340,7 @@ nestController0 cer (gss', sss') r'2r = \r' ->
           Just s' -> do
              s'_ <- Pipes.for (runController0 cer r' s')
                               (Pipes.yield . fmap (r2r0 . r'2r))
-             return (Just (), ss0s' s'_)
+             return (Just (), ss0s' s'_))))
 {-# INLINABLE nestController0 #-}
 
 --------------------------------------------------------------------------------
@@ -354,14 +351,18 @@ newtype VR v r x = VR { unVR :: IO () -> (r -> IO ()) -> v -> IO (x, v) }
   deriving (Functor)
 
 instance Monad (VR v r) where
-  return a = VR $ \_ _ v -> return (a, v)
-  ma >>= kmb = VR $ \stopIO reqIO v -> do
-    (a, v') <- unVR ma stopIO reqIO v
-    unVR (kmb a) stopIO reqIO v'
+  return = \a -> VR (\_ _ v -> return (a, v))
+  {-# INLINABLE return #-}
+  (>>=) = \ma kmb -> VR (\stopIO reqIO v -> do
+      (a, v') <- unVR ma stopIO reqIO v
+      unVR (kmb a) stopIO reqIO v')
+  {-# INLINABLE (>>=) #-}
 
 instance Applicative (VR v r) where
   pure = return
+  {-# INLINABLE pure #-}
   (<*>) = ap
+  {-# INLINABLE (<*>) #-}
 
 -- | Warning: The 'IO' actions taking in place in 'VR' are intended to prepare
 -- the rendering result, but they are not part of the rendering result itself
@@ -370,11 +371,13 @@ instance Applicative (VR v r) where
 -- at the time of rendering, then return that action as the result of the @VR@
 -- action, that is, have @'VR' v r ('IO' ())@ or similar.
 instance MonadIO (VR v r) where
-  liftIO m = VR $ \_ _ v -> fmap (flip (,) v) m
+  liftIO = \m -> VR (\_ _ v -> fmap (flip (,) v) m)
+  {-# INLINABLE liftIO #-}
 
 -- | View state.
 instance State.MonadState v (VR v r) where
-  state k = VR $ \_ _ v -> return (k v)
+  state k = VR (\_ _ v -> return (k v))
+  {-# INLINABLE state #-}
 
 -- | Returns an action that will stop the execution of the running application
 -- when used. This is comparable to using 'stop' in a 'C'.
@@ -382,7 +385,8 @@ instance State.MonadState v (VR v r) where
 -- It is safe to keep, share, or call the returned action more than once; it
 -- is valid during the whole execution of the Lei application.
 getStop :: VR v r (IO ())
-getStop = VR $ \a _ v -> return (a, v)
+getStop = VR (\a _ v -> return (a, v))
+{-# INLINABLE getStop #-}
 
 -- | Render a view that had been previously nested using 'nestView'.
 --
@@ -390,7 +394,8 @@ getStop = VR $ \a _ v -> return (a, v)
 -- haven't changed since the last time the given @'ViewRender' v r s x@ was
 -- 'render'ed.
 render :: ViewRender v r s x -> s -> VR v r x
-render vr s = VR $ \stopIO reqIO v -> unVR (unViewRender vr s) stopIO reqIO v
+render vr = \s -> VR (\stopIO reqIO v -> unVR (unViewRender vr s) stopIO reqIO v)
+{-# INLINABLE render #-}
 
 --------------------------------------------------------------------------------
 
@@ -406,15 +411,15 @@ mkViewRenderCacheLast
   -> IO (ViewRender v r s x)
 mkViewRenderCacheLast kvr = do
   iorCache <- IORef.newIORef ((\_ _ -> Nothing) :: s -> v -> Maybe (x, v))
-  return $ ViewRender $ \s0 -> VR $ \stopIO reqIO v0 -> do
+  return (ViewRender (\s0 -> VR (\stopIO reqIO v0 -> do
      cacheLookup <- IORef.readIORef iorCache
      case cacheLookup s0 v0 of
         Just xv -> return xv
         Nothing -> do
            !xv@(!_,!_) <- unVR (kvr reqIO s0) stopIO reqIO v0
-           IORef.atomicWriteIORef iorCache $ \s v ->
-              if s == s0 && v == v0 then Just xv else Nothing
-           return xv
+           IORef.atomicWriteIORef iorCache (\s v ->
+              if s == s0 && v == v0 then Just xv else Nothing)
+           return xv)))
 
 --------------------------------------------------------------------------------
 -- See the documentation for 'mkView'.
@@ -424,6 +429,7 @@ runView :: Monad m => View v r s m x -> m (v, ViewStop v, ViewRender v r s x)
 runView (View vi0) = do
    ((v0, vs0, vrr0), vs) <- runViewInit vi0
    return (v0, mappend vs vs0, vrr0)
+{-# INLINABLE runView #-}
 
 -- | Creates a 'View' describing the lifetime of a 'ViewRender', consisting of
 -- an initialization routine ('ViewInit') to be executed only once at the
@@ -456,10 +462,11 @@ mkView
   --
   --   @x@: rendering result.
   -> View v r s m x
-mkView vi = View $ do
+mkView vi = View (do
   (v, iovs, kvr) <- vi
-  vr <- liftIO $ mkViewRenderCacheLast kvr
-  return (v, mkViewStop iovs, vr)
+  vr <- liftIO (mkViewRenderCacheLast kvr)
+  return (v, mkViewStop iovs, vr))
+{-# INLINABLE mkView #-}
 
 -- | Like 'mkView', except for when there is no view state, initialization nor
 -- finalization to worry about.
@@ -471,7 +478,8 @@ mkViewSimple
                               --
                               --   @x@: rendering result.
   -> View () r s m x
-mkViewSimple kvr = mkView $ return ((), return, ((return.).) kvr)
+mkViewSimple kvr = mkView (return ((), return, ((return.).) kvr))
+{-# INLINABLE mkViewSimple #-}
 
 --------------------------------------------------------------------------------
 
@@ -499,14 +507,14 @@ nestView
  -> (r' -> r)
  -> View v' r' s m x
  -> ViewInit v m (v', ViewRender v r s x) -- ^
-nestView lvv' r'2r av'w = ViewInit $ do
-   (av', av's, av'rr) <- lift $ runView av'w
-   State.modify $ mappend (contramapViewStop (view lvv') av's)
-   let vrr = ViewRender $ \s0 -> VR $ \stopIO reqIO v -> do
+nestView lvv' r'2r av'w = ViewInit (do
+   (av', av's, av'rr) <- lift (runView av'w)
+   State.modify (mappend (contramapViewStop (view lvv') av's))
+   let vrr = ViewRender (\s0 -> VR (\stopIO reqIO v -> do
           let v'1 = view lvv' v
           (x, v'2) <- unVR (unViewRender av'rr s0) stopIO (reqIO . r'2r) v'1
-          return (x, set lvv' v'2 v)
-   return (av', vrr)
+          return (x, set lvv' v'2 v)))
+   return (av', vrr))
 
 --------------------------------------------------------------------------------
 
@@ -543,77 +551,77 @@ run
   -> m ()
 run bracket dbg0 s0 cer vw = do
     -- Debug broadcast channel
-    tcbDebug <- liftIO $ STM.newBroadcastTChanIO
-    let dbgIO = STM.atomically . STM.writeTChan tcbDebug
+    tcbDebug <- liftIO STM.newBroadcastTChanIO
     -- Channel through which requests are sent
-    tqR <- liftIO $ STM.newTQueueIO
+    tqR <- liftIO STM.newTQueueIO
     let reqIO = STM.atomically . STM.writeTQueue tqR
     -- TMVar where the last known model state is stored.
     -- 'Right' means it needs rendering.
-    tmvSLast <- liftIO $ STM.newTMVarIO (Right s0)
+    tmvSLast <- liftIO (STM.newTMVarIO (Right s0))
     -- TVar indicating whether to stop execution
-    tvStop <- liftIO $ STM.newTVarIO False -- TODO: a `MVar ()` should do
-    let stopIO = STM.atomically $ do
+    tvStop <- liftIO (STM.newTVarIO False) -- TODO: a `MVar ()` should do
+    let stopIO = STM.atomically (do
           STM.writeTVar tvStop True
-          STM.writeTChan tcbDebug DebugStopRequested
+          STM.writeTChan tcbDebug DebugStopRequested)
     -- Handle an incomming requests
     let handlerLoop :: m ()
-        handlerLoop = ($ s0) $ fix $ \loop s -> do
-           stopped <- liftIO $ STM.atomically $ STM.readTVar tvStop
-           unless stopped $ do
-              r <- liftIO $ STM.atomically $ do
+        handlerLoop = ($ s0) (fix (\loop s -> do
+           stopped <- liftIO (STM.atomically (STM.readTVar tvStop))
+           unless stopped (do
+              r <- liftIO (STM.atomically (do
                  r <- STM.readTQueue tqR
-                 r <$ STM.writeTChan tcbDebug (DebugReqStart r s)
-              !s' <- Pipes.runEffect $ do
-                 Pipes.for (runController0 cer r s) $ \mr' -> do
+                 r <$ STM.writeTChan tcbDebug (DebugReqStart r s)))
+              !s' <- Pipes.runEffect (do
+                 Pipes.for (runController0 cer r s) (\mr' -> do
                     case mr' of
-                       Just r' -> liftIO $ reqIO r'
-                       Nothing -> liftIO stopIO >> lift (loop s)
-              liftIO $ STM.atomically $ do
-                 void $ STM.tryTakeTMVar tmvSLast
+                       Just r' -> liftIO (reqIO r')
+                       Nothing -> liftIO stopIO >> lift (loop s)))
+              liftIO (STM.atomically (do
+                 void (STM.tryTakeTMVar tmvSLast)
                  if s == s'
                     then do STM.putTMVar tmvSLast (Left s')
-                            STM.writeTChan tcbDebug $ DebugStateSame s'
+                            STM.writeTChan tcbDebug (DebugStateSame s')
                     else do STM.putTMVar tmvSLast (Right s')
-                            STM.writeTChan tcbDebug $ DebugStateNew s'
-              loop s'
+                            STM.writeTChan tcbDebug (DebugStateNew s')))
+              loop s')))
     -- Render the model
-    let renderLoop :: v -> ViewStop v -> ViewRender v r s (IO ()) -> IO ()
-        renderLoop v0 vs vrr = ($ v0) $ fix $ \loop v -> do
-           flip Ex.onException (runViewStop vs v) $ do
-              stopped <- STM.atomically $ STM.readTVar tvStop
+    let renderLoop :: ViewStop v -> ViewRender v r s (IO ()) -> v -> IO ()
+        renderLoop vs vrr = fix (\loop v -> do
+           flip Ex.onException (runViewStop vs v) (do
+              stopped <- STM.atomically (STM.readTVar tvStop)
               if stopped
                  then runViewStop vs v
                  else do
                     Ex.bracketOnError
-                       (STM.atomically $ do
+                       (STM.atomically (do
                            es <- STM.takeTMVar tmvSLast
                            case es of
                               Left _ -> STM.retry
                               Right s -> do
                                 STM.writeTChan tcbDebug (DebugRenderStart v s)
-                                return s)
-                       (\s -> STM.atomically $ do
-                           void $ STM.tryPutTMVar tmvSLast $ Right s)
+                                return s))
+                       (\s -> STM.atomically (do
+                           void (STM.tryPutTMVar tmvSLast (Right s))))
                        (\s -> do
                            (io, v') <- unVR (unViewRender vrr s) stopIO reqIO v
-                           io >> loop v')
+                           io >> loop v')))
         debugging :: forall x. m x -> m x
         debugging k = bracket
-           (liftIO $ do
-              tcbDebug' <- STM.atomically $ STM.dupTChan tcbDebug
-              Async.async $ dbg0 $ STM.atomically $ STM.readTChan tcbDebug')
+           (liftIO (do
+              tcbDebug' <- STM.atomically (STM.dupTChan tcbDebug)
+              Async.async (dbg0 (STM.atomically (STM.readTChan tcbDebug')))))
            (liftIO . Async.cancel)
            (\_ -> k)
 
-    debugging $ bracket
+    debugging (bracket
        (do (v, vs, vrr) <- runView vw
-           liftIO $ dbgIO $ DebugViewInitialized v
-           liftIO $ flip Ex.onException (runViewStop vs v) $ do
-              a1 <- Async.async $ renderLoop v vs vrr
-              a1 <$ Async.link a1)
+           liftIO (do
+              STM.atomically (STM.writeTChan tcbDebug (DebugViewInitialized v))
+              flip Ex.onException (runViewStop vs v) (do
+                 a1 <- Async.async (renderLoop vs vrr v)
+                 a1 <$ Async.link a1)))
        (liftIO . Async.cancel)
-       (\a1 -> handlerLoop >> liftIO (Async.wait a1))
+       (\a1 -> handlerLoop >> liftIO (Async.wait a1)))
 
 
 data Debug v r s
