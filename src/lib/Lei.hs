@@ -421,7 +421,7 @@ mkViewRenderCacheLast kvr = do
 --------------------------------------------------------------------------------
 -- See the documentation for 'mkView'.
 data View v r s m x
-  = View !((r -> IO ()) -> ViewInit v m (v, ViewStop v, ViewRender v s x))
+  = View !((r -> IO ()) -> ViewInit v r m (v, ViewStop v, ViewRender v s x))
 
 runView
   :: Monad m
@@ -429,7 +429,7 @@ runView
   -> (r -> IO ())
   -> m (v, ViewStop v, ViewRender v s x)
 runView (View kvi0) reqIO = do
-   ((v0, vs0, vrr0), vs) <- runViewInit (kvi0 reqIO)
+   ((v0, vs0, vrr0), vs) <- runViewInit (kvi0 reqIO) reqIO
    return (v0, mappend vs vs0, vrr0)
 {-# INLINABLE runView #-}
 
@@ -453,7 +453,7 @@ runView (View kvi0) reqIO = do
 -- using 'run', or it can be nested in larger 'View's using 'nestView'.
 mkView
   :: (MonadIO m, Eq v, Eq s)
-  => ((r -> IO ()) -> ViewInit v m (v, v -> IO (), s -> VR v x))
+  => ((r -> IO ()) -> ViewInit v r m (v, v -> IO (), s -> VR v x))
   -- ^ @v@: view state.
   --
   --   @v -> 'IO' ()@: release resources acquired by 'ViewInit'.
@@ -491,11 +491,34 @@ mkViewSimple kvr = mkView (\reqIO -> return ((), return, return . kvr reqIO))
 
 -- | Action to be executed just once during the initialization of a 'View',
 -- preparing an initial view state of type @v@.
-newtype ViewInit v m a = ViewInit (State.StateT (ViewStop v) m a)
-  deriving (Functor, Applicative, Monad, MonadIO, MonadTrans)
+newtype ViewInit v r m a
+  = ViewInit { unViewInit :: (r -> IO ()) -> (State.StateT (ViewStop v) m a) }
+  deriving (Functor)
 
-runViewInit :: ViewInit v m a -> m (a, ViewStop v)
-runViewInit (ViewInit s) = State.runStateT s mempty
+instance Monad m => Monad (ViewInit v r m) where
+  return = \a -> ViewInit (\_ -> return a)
+  {-# INLINABLE return #-}
+  ma >>= k = ViewInit (\reqIO -> do
+     a <- unViewInit ma reqIO
+     unViewInit (k a) reqIO)
+  {-# INLINABLE (>>=) #-}
+
+instance (Monad m, Functor m) => Applicative (ViewInit v r m) where
+  pure = return
+  {-# INLINABLE pure #-}
+  (<*>) = ap
+  {-# INLINABLE (<*>) #-}
+
+instance MonadIO m => MonadIO (ViewInit v r m) where
+  liftIO = lift . liftIO
+  {-# INLINABLE liftIO #-}
+
+instance MonadTrans (ViewInit v r) where
+  lift = ViewInit . const . lift
+  {-# INLINABLE lift #-}
+
+runViewInit :: ViewInit v r m a -> (r -> IO ()) -> m (a, ViewStop v)
+runViewInit (ViewInit k) reqIO = State.runStateT (k reqIO) mempty
 
 -- | Nest a smaller 'View' within a larger 'View'.
 --
@@ -510,11 +533,11 @@ runViewInit (ViewInit s) = State.runStateT s mempty
 nestView
  :: Monad m
  => Lens' v v'
- -> (r' -> IO ())
+ -> (r' -> r)
  -> View v' r' s m x
- -> ViewInit v m (v', ViewRender v s x) -- ^
-nestView lvv' reqIO' av'w = ViewInit (do
-   (av', av's, av'rr) <- lift (runView av'w reqIO')
+ -> ViewInit v r m (v', ViewRender v s x) -- ^
+nestView lvv' r'2r av'w = ViewInit (\reqIO -> do
+   (av', av's, av'rr) <- lift (runView av'w (reqIO . r'2r))
    State.modify (mappend (contramapViewStop (view lvv') av's))
    let vrr = ViewRender (\s0 -> VR (\stopIO v -> do
           let v'1 = view lvv' v
