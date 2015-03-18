@@ -100,7 +100,6 @@ module Lei
   , ViewRender
 
   , VR
-  , getStop
   , render
 
   -- * Debug
@@ -345,15 +344,15 @@ nestController0 cer (gss', sss') r'2r = \r' ->
 
 --------------------------------------------------------------------------------
 -- | While having access to a view state @v@, render an @x@.
-newtype VR v x = VR { unVR :: IO () -> v -> IO (x, v) }
+newtype VR v x = VR { unVR :: v -> IO (x, v) }
   deriving (Functor)
 
 instance Monad (VR v) where
-  return = \a -> VR (\_ v -> return (a, v))
+  return = \a -> VR (\v -> return (a, v))
   {-# INLINABLE return #-}
-  (>>=) = \ma kmb -> VR (\stopIO v -> do
-      (a, v') <- unVR ma stopIO v
-      unVR (kmb a) stopIO v')
+  (>>=) = \ma kmb -> VR (\v -> do
+      (a, v') <- unVR ma v
+      unVR (kmb a) v')
   {-# INLINABLE (>>=) #-}
 
 instance Applicative (VR v) where
@@ -369,22 +368,13 @@ instance Applicative (VR v) where
 -- at the time of rendering, then return that action as the result of the @VR@
 -- action, that is, have @'VR' v r ('IO' ())@ or similar.
 instance MonadIO (VR v) where
-  liftIO = \m -> VR (\_ v -> fmap (flip (,) v) m)
+  liftIO = \m -> VR (\v -> fmap (flip (,) v) m)
   {-# INLINABLE liftIO #-}
 
 -- | View state.
 instance State.MonadState v (VR v) where
-  state k = VR (\_ v -> return (k v))
+  state k = VR (return . k)
   {-# INLINABLE state #-}
-
--- | Returns an action that will stop the execution of the running application
--- when used. This is comparable to using 'stop' in a 'C'.
---
--- It is safe to keep, share, or call the returned action more than once; it
--- is valid during the whole execution of the Lei application.
-getStop :: VR v (IO ())
-getStop = VR (\a v -> return (a, v))
-{-# INLINABLE getStop #-}
 
 -- | Render a view that had been previously nested using 'nestView'.
 --
@@ -392,7 +382,7 @@ getStop = VR (\a v -> return (a, v))
 -- haven't changed since the last time the given @'ViewRender' v s x@ was
 -- 'render'ed.
 render :: ViewRender v s x -> s -> VR v x
-render vr = \s -> VR (\stopIO v -> unVR (unViewRender vr s) stopIO v)
+render vr = \s -> VR (unVR (unViewRender vr s))
 {-# INLINABLE render #-}
 
 --------------------------------------------------------------------------------
@@ -408,12 +398,12 @@ mkViewRenderCacheLast
   -> IO (ViewRender v s x)
 mkViewRenderCacheLast kvr = do
   iorCache <- IORef.newIORef ((\_ _ -> Nothing) :: s -> v -> Maybe (x, v))
-  return (ViewRender (\s0 -> VR (\stopIO v0 -> do
+  return (ViewRender (\s0 -> VR (\v0 -> do
      cacheLookup <- IORef.readIORef iorCache
      case cacheLookup s0 v0 of
         Just xv -> return xv
         Nothing -> do
-           !xv@(!_,!_) <- unVR (kvr s0) stopIO v0
+           !xv@(!_,!_) <- unVR (kvr s0) v0
            IORef.atomicWriteIORef iorCache (\s v ->
               if s == s0 && v == v0 then Just xv else Nothing)
            return xv)))
@@ -421,15 +411,16 @@ mkViewRenderCacheLast kvr = do
 --------------------------------------------------------------------------------
 -- See the documentation for 'mkView'.
 data View v r s m x
-  = View !((r -> IO ()) -> ViewInit v r m (v, ViewStop v, ViewRender v s x))
+  = View !((r -> IO ()) -> IO () -> ViewInit v r m (v, ViewStop v, ViewRender v s x))
 
 runView
   :: Monad m
   => View v r s m x
   -> (r -> IO ())
+  -> IO ()
   -> m (v, ViewStop v, ViewRender v s x)
-runView (View kvi0) reqIO = do
-   ((v0, vs0, vrr0), vs) <- runViewInit (kvi0 reqIO) reqIO
+runView (View kvi0) reqIO stopIO = do
+   ((v0, vs0, vrr0), vs) <- runViewInit (kvi0 reqIO stopIO) reqIO stopIO
    return (v0, mappend vs vs0, vrr0)
 {-# INLINABLE runView #-}
 
@@ -453,23 +444,25 @@ runView (View kvi0) reqIO = do
 -- using 'run', or it can be nested in larger 'View's using 'nestView'.
 mkView
   :: (MonadIO m, Eq v, Eq s)
-  => ((r -> IO ()) -> ViewInit v r m (v, v -> IO (), s -> VR v x))
-  -- ^ @v@: view state.
-  --
-  --   @v -> 'IO' ()@: release resources acquired by 'ViewInit'.
-  --
-  --   @s@: model state to render.
-  --
-  --   @r -> 'IO' ()@: issue a request. Note that, even if it is perfectly safe
+  => ((r -> IO ()) -> IO () -> ViewInit v r m (v, v -> IO (), s -> VR v x))
+  -- ^ @r -> 'IO' ()@: issue a request. Note that, even if it is perfectly safe
   --   to do so, issuing requests from within the 'ViewInit' is not very useful.
   --   It's more likely that you will just want to pass this function to other
   --   tools setup during the view initialization process, such as nested views
   --   or third-party event handlers.
   --
+  --   @'IO' ()@: gracefully stop the entire Lei application.
+  --
+  --   @v@: view state.
+  --
+  --   @v -> 'IO' ()@: release resources acquired by 'ViewInit'.
+  --
+  --   @s@: model state to render.
+  --
   --   @x@: rendering result.
   -> View v r s m x
-mkView kvi = View (\reqIO -> do
-  (v, iovs, kvr) <- kvi reqIO
+mkView kvi = View (\reqIO stopIO -> do
+  (v, iovs, kvr) <- kvi reqIO stopIO
   vr <- liftIO (mkViewRenderCacheLast kvr)
   return (v, mkViewStop iovs, vr))
 {-# INLINABLE mkView #-}
@@ -484,7 +477,7 @@ mkViewSimple
                               --
                               --   @x@: rendering result.
   -> View () r s m x
-mkViewSimple kvr = mkView (\reqIO -> return ((), return, return . kvr reqIO))
+mkViewSimple kvr = mkView (\reqIO _ -> return ((), return, return . kvr reqIO))
 {-# INLINABLE mkViewSimple #-}
 
 --------------------------------------------------------------------------------
@@ -492,15 +485,15 @@ mkViewSimple kvr = mkView (\reqIO -> return ((), return, return . kvr reqIO))
 -- | Action to be executed just once during the initialization of a 'View',
 -- preparing an initial view state of type @v@.
 newtype ViewInit v r m a
-  = ViewInit { unViewInit :: (r -> IO ()) -> (State.StateT (ViewStop v) m a) }
+  = ViewInit { unViewInit :: (r -> IO ()) -> IO () -> (State.StateT (ViewStop v) m a) }
   deriving (Functor)
 
 instance Monad m => Monad (ViewInit v r m) where
-  return = \a -> ViewInit (\_ -> return a)
+  return = \a -> ViewInit (\_ _ -> return a)
   {-# INLINABLE return #-}
-  ma >>= k = ViewInit (\reqIO -> do
-     a <- unViewInit ma reqIO
-     unViewInit (k a) reqIO)
+  ma >>= k = ViewInit (\reqIO stopIO -> do
+     a <- unViewInit ma reqIO stopIO
+     unViewInit (k a) reqIO stopIO)
   {-# INLINABLE (>>=) #-}
 
 instance (Monad m, Functor m) => Applicative (ViewInit v r m) where
@@ -514,11 +507,11 @@ instance MonadIO m => MonadIO (ViewInit v r m) where
   {-# INLINABLE liftIO #-}
 
 instance MonadTrans (ViewInit v r) where
-  lift = ViewInit . const . lift
+  lift = \m -> ViewInit (\_ _ -> lift m)
   {-# INLINABLE lift #-}
 
-runViewInit :: ViewInit v r m a -> (r -> IO ()) -> m (a, ViewStop v)
-runViewInit (ViewInit k) reqIO = State.runStateT (k reqIO) mempty
+runViewInit :: ViewInit v r m a -> (r -> IO ()) -> IO () -> m (a, ViewStop v)
+runViewInit (ViewInit k) reqIO stopIO = State.runStateT (k reqIO stopIO) mempty
 
 -- | Nest a smaller 'View' within a larger 'View'.
 --
@@ -536,12 +529,12 @@ nestView
  -> (r' -> r)
  -> View v' r' s m x
  -> ViewInit v r m (v', ViewRender v s x) -- ^
-nestView lvv' r'2r av'w = ViewInit (\reqIO -> do
-   (av', av's, av'rr) <- lift (runView av'w (reqIO . r'2r))
+nestView lvv' r'2r av'w = ViewInit (\reqIO stopIO -> do
+   (av', av's, av'rr) <- lift (runView av'w (reqIO . r'2r) stopIO)
    State.modify (mappend (contramapViewStop (view lvv') av's))
-   let vrr = ViewRender (\s0 -> VR (\stopIO v -> do
+   let vrr = ViewRender (\s0 -> VR (\v -> do
           let v'1 = view lvv' v
-          (x, v'2) <- unVR (unViewRender av'rr s0) stopIO v'1
+          (x, v'2) <- unVR (unViewRender av'rr s0) v'1
           return (x, set lvv' v'2 v)))
    return (av', vrr))
 
@@ -632,7 +625,7 @@ run bracket dbg0 s0 cer vw = do
                        (\s -> STM.atomically (do
                            void (STM.tryPutTMVar tmvSLast (Right s))))
                        (\s -> do
-                           (io, v') <- unVR (unViewRender vrr s) stopIO v
+                           (io, v') <- unVR (unViewRender vrr s) v
                            io >> loop v')))
         debugging :: forall x. m x -> m x
         debugging k = bracket
@@ -643,7 +636,7 @@ run bracket dbg0 s0 cer vw = do
            (\_ -> k)
 
     debugging (bracket
-       (do (v, vs, vrr) <- runView vw reqIO
+       (do (v, vs, vrr) <- runView vw reqIO stopIO
            liftIO (do
               STM.atomically (STM.writeTChan tcbDebug (DebugViewInitialized v))
               flip Ex.onException (runViewStop vs v) (do
