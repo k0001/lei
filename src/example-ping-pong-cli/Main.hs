@@ -1,9 +1,8 @@
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE TemplateHaskell #-}
 
 module Main (main) where
 
-import           Control.Lens ((.=), (%=), (-=), makeLenses)
+import           Control.Lens ((.=), (%=), (-=), (<&>), Lens')
 import           Control.Applicative
 import qualified Control.Concurrent.Async as Async
 import qualified Control.Concurrent.MVar as MVar
@@ -37,17 +36,23 @@ data Model = Model
   { _appStatus      :: !PingPong
   , _appChangesLeft :: !Integer
   , _appErrors      :: ![Error]
-  , _appStop        :: !Bool
   } deriving (Eq, Show)
 
-makeLenses ''Model
+appStatus :: Lens' Model PingPong
+appStatus f s@Model{_appStatus=a} = f a <&> \b -> s{_appStatus=b}
+
+appChangesLeft :: Lens' Model Integer
+appChangesLeft f s@Model{_appChangesLeft=a} = f a <&> \b -> s{_appChangesLeft=b}
+
+appErrors :: Lens' Model [Error]
+appErrors f s@Model{_appErrors=a} = f a <&> \b -> s{_appErrors=b}
 
 -- | @'def' n@ create an 'Model' starting on a 'Ping' state that allows up to
 -- @n@ changes, where @n > 0@.
 def :: Integer -> Maybe Model
 def n = do
     guard $ n > 0
-    return $ Model Ping n [] False
+    return $ Model Ping n []
 
 --------------------------------------------------------------------------------
 -- THE VIEW
@@ -118,7 +123,7 @@ controller :: MonadIO m => Lei.Controller r0 s0 Req Model m
 controller = Lei.mkController $ \r -> do
   appErrors .= []
   case r of
-    ReqStop -> appStop .= True
+    ReqStop -> Lei.stop
     ReqSetStatus dst -> do -- TODO: MonadPlus instance for Lei.C
       s <- State.get
       let errors = concat

@@ -510,6 +510,11 @@ instance MonadTrans (ViewInit v r) where
   lift = \m -> ViewInit (\_ _ -> lift m)
   {-# INLINABLE lift #-}
 
+instance MFunctor (ViewInit v r) where
+  hoist nat = \m -> ViewInit (\reqIO stopIO ->
+      hoist nat (unViewInit m reqIO stopIO))
+  {-# INLINABLE hoist #-}
+
 runViewInit :: ViewInit v r m a -> (r -> IO ()) -> IO () -> m (a, ViewStop v)
 runViewInit (ViewInit k) reqIO stopIO = State.runStateT (k reqIO stopIO) mempty
 
@@ -645,6 +650,7 @@ run bracket dbg0 s0 cer vw = do
        (liftIO . Async.cancel)
        (\a1 -> handlerLoop >> liftIO (Async.wait a1)))
 
+--------------------------------------------------------------------------------
 
 data Debug v r s
   = DebugStopRequested
