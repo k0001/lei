@@ -80,6 +80,7 @@ module Lei
   , mkController
   , controlling
   , controlling0
+  , hoistController
 
   , C
   , req
@@ -104,6 +105,7 @@ module Lei
 
   -- * Debug
   , Debug(..)
+  , mapDebug
   ) where
 
 import           Control.Applicative
@@ -157,6 +159,15 @@ instance Monad m => Monoid (Controller r0 s0 r s m) where
 mkController :: (r -> C r0 s0 r s m ()) -> Controller r0 s0 r s m -- ^
 mkController = Controller
 {-# INLINABLE mkController #-}
+
+-- | 'hoist' the monad underlying this 'Controller'.
+hoistController
+  :: Monad m
+  => (forall a. m a -> n a) -- ^ Monad morphism
+  -> Controller r0 s0 r s m
+  -> Controller r0 s0 r s n
+hoistController nat = \c -> Controller (\r -> hoist nat (unController c r))
+{-# INLINABLE hoistController #-}
 
 -- | Nest a @'Controller' r0 s0 s' r' m@ inside a larger
 -- @'Controller' r0 s0 s r m@ ensuring that it executes when as for as
@@ -390,6 +401,14 @@ render vr = \s -> VR (unVR (unViewRender vr s))
 -- | Renders a model of type @s@ as an @x@. While rendering, access to the view
 -- state @v@ is available for read and write purposes.
 newtype ViewRender v s x = ViewRender { unViewRender :: s -> VR v x }
+  deriving (Functor)
+
+instance Monoid x => Monoid (ViewRender v s x) where
+  mempty = ViewRender (\_ -> return mempty)
+  {-# INLINE mempty #-}
+  mappend a b =
+      ViewRender (\s -> mappend <$> unViewRender a s <*> unViewRender b s)
+  {-# INLINE mappend #-}
 
 mkViewRenderCacheLast
   :: forall v s x
@@ -410,8 +429,15 @@ mkViewRenderCacheLast kvr = do
 
 --------------------------------------------------------------------------------
 -- See the documentation for 'mkView'.
-data View v r s m x
-  = View !((r -> IO ()) -> IO () -> ViewInit v r m (v, ViewStop v, ViewRender v s x))
+newtype View v r s m x
+  = View { unView :: (r -> IO ())
+                  -> IO ()
+                  -> ViewInit v r m (v, ViewStop v, ViewRender v s x) }
+  deriving (Functor)
+
+instance MFunctor (View v r s) where
+  hoist nat = \m -> View (\reqIO stopIO -> hoist nat (unView m reqIO stopIO))
+  {-# INLINABLE hoist #-}
 
 runView
   :: Monad m
@@ -419,8 +445,8 @@ runView
   -> (r -> IO ())
   -> IO ()
   -> m (v, ViewStop v, ViewRender v s x)
-runView (View kvi0) reqIO stopIO = do
-   ((v0, vs0, vrr0), vs) <- runViewInit (kvi0 reqIO stopIO) reqIO stopIO
+runView a reqIO stopIO = do
+   ((v0, vs0, vrr0), vs) <- runViewInit (unView a reqIO stopIO) reqIO stopIO
    return (v0, mappend vs vs0, vrr0)
 {-# INLINABLE runView #-}
 
@@ -660,6 +686,20 @@ data Debug v r s
   | DebugStateNew s
   | DebugStateSame s
   deriving (Eq, Ord, Show, Data, Typeable, Generic)
+
+mapDebug
+  :: (v -> v')
+  -> (r -> r')
+  -> (s -> s')
+  -> Debug v r s
+  -> Debug v' r' s' -- ^
+mapDebug fv fr fs = \x -> case x of
+    DebugStopRequested     -> DebugStopRequested
+    DebugViewInitialized v -> DebugViewInitialized (fv v)
+    DebugRenderStart v s   -> DebugRenderStart (fv v) (fs s)
+    DebugReqStart r s      -> DebugReqStart (fr r) (fs s)
+    DebugStateNew s        -> DebugStateNew (fs s)
+    DebugStateSame s       -> DebugStateSame (fs s)
 
 --------------------------------------------------------------------------------
 -- Internal tools
